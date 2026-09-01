@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>ChatGPT Shadow</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>ChatGPT Shadow</h1>
+      <p class="hint">Local copy of ChatGPT web chats. Nothing leaves this machine.</p>
+      <label class="check">
+        <input id="enabled" type="checkbox" checked />
+        Capture chats
+      </label>
+      <p id="status" class="status">Loading…</p>
+      <div class="actions">
+        <button id="exportAll" type="button">Export JSONL</button>
+        <button id="clearAll" type="button" class="ghost">Clear</button>
+      </div>
+    </header>
+
+    <section class="pane">
+      <div class="pane-head">
+        <span>Conversations</span>
+      </div>
+      <div id="threads" class="list"></div>
+      <p id="empty" class="fine">Open a ChatGPT chat to start capturing.</p>
+    </section>
+
+    <section id="detail" class="pane" hidden>
+      <div class="pane-head">
+        <strong id="detailTitle">Conversation</strong>
+        <button id="exportOne" type="button" class="ghost">Export</button>
+      </div>
+      <div class="legend">
+        <span class="who you">You</span>
+        <span class="who gpt">ChatGPT</span>
+      </div>
+      <div id="messages" class="thread"></div>
+    </section>
+
+    <script src="extract.js"></script>
+    <script src="store.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

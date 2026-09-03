@@ -2,11 +2,12 @@
   "manifest_version": 3,
   "name": "ChatGPT Shadow",
   "version": "0.1.0",
-  "description": "Copy ChatGPT web chats into local extension storage.",
-  "permissions": ["storage", "unlimitedStorage"],
+  "description": "Copy ChatGPT web chats into local extension storage, and optionally sync them to your own Topos.",
+  "permissions": ["storage", "unlimitedStorage", "identity"],
   "host_permissions": [
     "https://chatgpt.com/*",
-    "https://chat.openai.com/*"
+    "https://chat.openai.com/*",
+    "https://cp.logu3s.com/*"
   ],
   "background": {
     "service_worker": "background.js"

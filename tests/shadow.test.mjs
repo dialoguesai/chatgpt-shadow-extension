@@ -6,13 +6,19 @@ import test from "node:test";
 import vm from "node:vm";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const sandbox = { console };
+// The extension ships classic scripts that hang themselves off globalThis, so the
+// suite can load every file into one sandbox exactly the way importScripts does.
+const sandbox = { console, crypto, btoa, TextEncoder };
 sandbox.globalThis = sandbox;
-vm.runInNewContext(fs.readFileSync(path.join(root, "extract.js"), "utf8"), sandbox);
-vm.runInNewContext(fs.readFileSync(path.join(root, "store.js"), "utf8"), sandbox);
+["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposIngest.js"].forEach((file) => {
+  vm.runInNewContext(fs.readFileSync(path.join(root, file), "utf8"), sandbox);
+});
 
 const Extract = sandbox.ChatGPTShadowExtract;
 const Store = sandbox.ChatGPTShadowStore;
+const ToposConfig = sandbox.ChatGPTShadowToposConfig;
+const ToposAuth = sandbox.ChatGPTShadowToposAuth;
+const ToposIngest = sandbox.ChatGPTShadowToposIngest;
 
 function el(attrs = {}, children = [], text = "") {
   const node = {
@@ -265,4 +271,251 @@ test("jsonl export is one v1 record per line", () => {
     assert.ok(row.id && row.thread_id && row.role && row.content);
     assert.equal(typeof row.created_at, "number");
   });
+});
+
+// ---------------------------------------------------------------------------
+// Topos write path. Every fixture id below is synthetic.
+// ---------------------------------------------------------------------------
+
+// The store runs inside a vm sandbox, so values it returns carry that realm's
+// prototypes. Copy them into this realm before a strict deep comparison.
+const list = (value) => Array.from(value);
+const plain = (value) => ({ ...value });
+
+const AUTO = { includeDerived: false, since: 0, skipStreaming: true };
+const HISTORY = { includeDerived: true, since: 0, skipStreaming: true };
+
+function seed(threadId, rows, conversation = {}) {
+  return Store.upsert(Store.emptyState(), { id: threadId, title: "Sample thread", ...conversation }, rows);
+}
+
+test("never sends a row whose thread id is still pending, and releases it after the remap", () => {
+  let state = seed("pending:1700000000", [
+    { id: "msg-0001", role: "user", content: "sample question", index: 0, created_at: 1700000000 },
+    { id: "msg-0002", role: "assistant", content: "sample answer", index: 1, created_at: 1700000001 },
+  ]);
+
+  const held = Store.syncScan(state, HISTORY);
+  assert.equal(held.records.length, 0);
+  assert.equal(held.held.pending, 2);
+
+  state = Store.remapThread(state, "pending:1700000000", "conv-0001");
+  const released = Store.syncScan(state, HISTORY);
+  assert.equal(released.records.length, 2);
+  assert.equal(released.held.pending, 0);
+  assert.deepEqual(
+    list(released.records.map((row) => row.thread_id)),
+    ["conv-0001", "conv-0001"]
+  );
+});
+
+test("a row filed under a real thread but still carrying a pending thread_id is held", () => {
+  const state = {
+    enabled: true,
+    index: { "conv-0002": { id: "conv-0002", streaming: false } },
+    messages: {
+      "conv-0002": [
+        { id: "msg-0003", thread_id: "pending:1700000002", role: "user", content: "sample", created_at: 1700000002 },
+      ],
+    },
+  };
+  const scan = Store.syncScan(state, HISTORY);
+  assert.equal(scan.records.length, 0);
+  assert.equal(scan.held.pending, 1);
+});
+
+test("content-hash ids are excluded from the automatic send and allowed in a history submit", () => {
+  const state = seed("conv-0003", [
+    { id: "msg-0004", role: "user", content: "sample question", index: 0, created_at: 1700000000 },
+    { id: "", role: "assistant", content: "sample answer", index: 1, created_at: 1700000001 },
+  ]);
+
+  const rows = state.messages["conv-0003"];
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].id_source, "dom");
+  assert.equal(rows[1].id_source, "derived");
+  assert.ok(rows[1].id.startsWith(Store.DERIVED_ID_PREFIX));
+
+  const auto = Store.syncScan(state, AUTO);
+  assert.deepEqual(
+    list(auto.records.map((row) => row.id)),
+    ["msg-0004"]
+  );
+  assert.equal(auto.held.derived, 1);
+
+  const history = Store.syncScan(state, HISTORY);
+  assert.equal(history.records.length, 2);
+  assert.equal(history.held.derived, 0);
+});
+
+test("a legacy row with no id_source is still recognised as a content-hash id", () => {
+  const state = {
+    enabled: true,
+    index: { "conv-0004": { id: "conv-0004", streaming: false } },
+    messages: {
+      "conv-0004": [
+        { id: "shadow:conv-0004:assistant:1:deadbeef", thread_id: "conv-0004", role: "assistant", content: "sample", created_at: 1700000000 },
+      ],
+    },
+  };
+  assert.equal(Store.isDerivedRow(state.messages["conv-0004"][0]), true);
+  assert.equal(Store.syncScan(state, AUTO).held.derived, 1);
+  assert.equal(Store.syncScan(state, HISTORY).records.length, 1);
+});
+
+test("holds every row in a thread whose reply is still streaming", () => {
+  const streaming = seed(
+    "conv-0005",
+    [{ id: "msg-0005", role: "assistant", content: "partial sam", index: 0, created_at: 1700000000 }],
+    { streaming: true }
+  );
+  assert.equal(Store.syncScan(streaming, HISTORY).records.length, 0);
+  assert.equal(Store.syncScan(streaming, HISTORY).held.streaming, 1);
+
+  const settled = Store.upsert(streaming, { id: "conv-0005", streaming: false }, [
+    { id: "msg-0005", role: "assistant", content: "partial sample answer", index: 0, created_at: 1700000000 },
+  ]);
+  assert.equal(Store.syncScan(settled, HISTORY).records.length, 1);
+});
+
+test("the synced marker stops a second send", () => {
+  let state = seed("conv-0006", [
+    { id: "msg-0006", role: "user", content: "sample question", index: 0, created_at: 1700000000 },
+    { id: "msg-0007", role: "assistant", content: "sample answer", index: 1, created_at: 1700000001 },
+  ]);
+
+  const first = Store.selectUnsynced(state, HISTORY);
+  assert.equal(first.length, 2);
+
+  state = Store.markSynced(state, first, 1700000100);
+  const second = Store.syncScan(state, HISTORY);
+  assert.equal(second.records.length, 0);
+  assert.equal(second.synced, 2);
+  assert.equal(state.messages["conv-0006"][0].synced_at, 1700000100);
+
+  // A newly captured row in the same thread still goes out.
+  state = Store.upsert(state, { id: "conv-0006" }, [
+    { id: "msg-0008", role: "user", content: "second sample question", index: 2, created_at: 1700000200 },
+  ]);
+  assert.deepEqual(
+    list(Store.selectUnsynced(state, HISTORY).map((row) => row.id)),
+    ["msg-0008"]
+  );
+});
+
+test("editing a row after it was sent clears the marker so the new text goes out", () => {
+  let state = seed("conv-0007", [
+    { id: "msg-0009", role: "assistant", content: "sample answer", index: 0, created_at: 1700000000 },
+  ]);
+  state = Store.markSynced(state, Store.selectUnsynced(state, HISTORY), 1700000100);
+  assert.equal(Store.selectUnsynced(state, HISTORY).length, 0);
+
+  state = Store.upsert(state, { id: "conv-0007" }, [
+    { id: "msg-0009", role: "assistant", content: "sample answer, revised", index: 0, created_at: 1700000000 },
+  ]);
+  assert.equal(state.messages["conv-0007"][0].synced_at, undefined);
+  assert.deepEqual(
+    list(Store.selectUnsynced(state, HISTORY).map((row) => row.content)),
+    ["sample answer, revised"]
+  );
+});
+
+test("markSynced skips a row whose text moved on while the batch was in flight", () => {
+  let state = seed("conv-0008", [
+    { id: "msg-0010", role: "assistant", content: "sample ans", index: 0, created_at: 1700000000 },
+  ]);
+  const inFlight = Store.selectUnsynced(state, HISTORY);
+  state = Store.upsert(state, { id: "conv-0008" }, [
+    { id: "msg-0010", role: "assistant", content: "sample answer", index: 0, created_at: 1700000000 },
+  ]);
+  state = Store.markSynced(state, inFlight, 1700000100);
+  assert.equal(state.messages["conv-0008"][0].synced_at, undefined);
+  assert.equal(Store.selectUnsynced(state, HISTORY).length, 1);
+});
+
+test("the automatic send ignores rows captured before the connection baseline", () => {
+  const state = seed("conv-0009", [
+    { id: "msg-0011", role: "user", content: "older sample", index: 0, created_at: 1700000000 },
+    // created_at has one-second resolution, so a row stamped in the connection
+    // second counts as backlog rather than being sent on a coin flip.
+    { id: "msg-0012", role: "user", content: "same second sample", index: 1, created_at: 1700005000 },
+    { id: "msg-0013", role: "user", content: "newer sample", index: 2, created_at: 1700009999 },
+  ]);
+  const auto = Store.syncScan(state, { includeDerived: false, since: 1700005000, skipStreaming: true });
+  assert.deepEqual(
+    list(auto.records.map((row) => row.id)),
+    ["msg-0013"]
+  );
+  assert.equal(auto.held.beforeBaseline, 2);
+  // The history submit is the only path for the backlog.
+  assert.equal(Store.countUnsynced(state, HISTORY), 3);
+});
+
+test("batches cap at 200 records", () => {
+  const rows = [];
+  for (let i = 0; i < 450; i += 1) {
+    rows.push({
+      id: `msg-${String(i).padStart(4, "0")}`,
+      role: i % 2 ? "assistant" : "user",
+      content: `sample line ${i}`,
+      index: i,
+      created_at: 1700000000 + i,
+    });
+  }
+  const state = seed("conv-0010", rows);
+  const records = Store.selectUnsynced(state, HISTORY);
+  assert.equal(records.length, 450);
+
+  const batches = Store.chunkRecords(records, ToposConfig.MAX_BATCH);
+  assert.deepEqual(
+    list(batches.map((batch) => batch.length)),
+    [200, 200, 50]
+  );
+  assert.equal(batches.flat().length, records.length);
+  // A caller asking for more than the cap still gets the cap.
+  assert.deepEqual(
+    list(Store.chunkRecords(records, 1000).map((batch) => batch.length)),
+    [200, 200, 50]
+  );
+  assert.equal(ToposConfig.MAX_BATCH, 200);
+});
+
+test("records sent to Topos carry the same frozen field set as the JSONL export", () => {
+  const state = seed("conv-0011", [
+    { id: "msg-0013", role: "user", content: "sample question", index: 0, created_at: 1700000000 },
+  ]);
+  const wire = Store.selectUnsynced(state, HISTORY)[0];
+  const exported = JSON.parse(Store.toJsonl(state).split("\n")[0]);
+  assert.deepEqual(list(Object.keys(wire)), ["id", "thread_id", "role", "content", "created_at"]);
+  assert.deepEqual(plain(wire), exported);
+  // Sync bookkeeping never reaches the wire or the export file.
+  assert.equal("synced_at" in wire, false);
+  assert.equal("id_source" in wire, false);
+});
+
+test("the ingest idempotency key is stable per batch and moves when content changes", () => {
+  const batch = [
+    { id: "msg-0014", thread_id: "conv-0012", role: "user", content: "sample question", created_at: 1700000000 },
+  ];
+  const edited = [{ ...batch[0], content: "sample question, revised" }];
+  assert.equal(ToposIngest.idempotencyKey(batch), ToposIngest.idempotencyKey(batch.map((row) => ({ ...row }))));
+  assert.notEqual(ToposIngest.idempotencyKey(batch), ToposIngest.idempotencyKey(edited));
+});
+
+test("the connect flow is configured for this extension", () => {
+  assert.equal(ToposConfig.APP_ID, "chatgpt-shadow-extension");
+  assert.equal(ToposConfig.SOURCE_ID, "chatgpt_ui_conversation");
+  assert.equal(ToposConfig.SCOPES, "ai_conversations:write");
+  assert.equal(ToposConfig.controlPlaneUrl().endsWith("/"), false);
+});
+
+test("pkce pairs are S256 and url safe", async () => {
+  const pair = await ToposAuth.createPkcePair();
+  assert.equal(pair.codeChallengeMethod, "S256");
+  assert.equal(pair.codeVerifier.length, 64);
+  assert.match(pair.codeVerifier, /^[A-Za-z0-9\-._~]+$/);
+  assert.equal(pair.codeChallenge.length, 43);
+  assert.match(pair.codeChallenge, /^[A-Za-z0-9\-_]+$/);
+  const other = await ToposAuth.createPkcePair();
+  assert.notEqual(pair.codeVerifier, other.codeVerifier);
 });

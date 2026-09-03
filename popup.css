@@ -267,3 +267,38 @@ button:hover {
   border-left: 2px solid #bbb;
   color: #444;
 }
+
+.pill {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 999px;
+  color: #3a3a3a;
+  background: #d9d9d9;
+}
+
+.pill[data-state="on"] {
+  color: #fff;
+  background: #2f6f3e;
+}
+
+.pill[data-state="warn"] {
+  color: #fff;
+  background: #a86400;
+}
+
+.pill[data-state="err"] {
+  color: #fff;
+  background: #a11f1f;
+}
+
+button[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.fine.err {
+  color: #a11f1f;
+}

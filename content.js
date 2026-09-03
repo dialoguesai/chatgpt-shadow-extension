@@ -65,7 +65,12 @@
     const threadId = urlId || pendingThreadId;
     if (!threadId) return;
 
-    const fingerprint = `${threadId}:${extracted.map((row) => `${row.id}:${row.content.length}`).join("|")}`;
+    // The streaming flag is part of the fingerprint: the scan where a reply settles
+    // is often identical in text, and the background only sends settled threads.
+    const streaming = ChatGPTShadowExtract.isStreaming(document);
+    const fingerprint = `${threadId}:${streaming ? 1 : 0}:${extracted
+      .map((row) => `${row.id}:${row.content.length}`)
+      .join("|")}`;
     if (fingerprint === lastFingerprint) return;
     lastFingerprint = fingerprint;
 
@@ -76,7 +81,7 @@
         id: threadId,
         title: ChatGPTShadowExtract.extractTitle(document),
         url: location.href,
-        streaming: ChatGPTShadowExtract.isStreaming(document),
+        streaming,
       },
       messages: extracted.map((row) => ({
         id: row.id,

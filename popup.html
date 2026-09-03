@@ -8,7 +8,7 @@
   <body>
     <header>
       <h1>ChatGPT Shadow</h1>
-      <p class="hint">Local copy of ChatGPT web chats. Nothing leaves this machine.</p>
+      <p class="hint">Local copy of ChatGPT web chats. Nothing is sent anywhere unless you connect a Topos account.</p>
       <label class="check">
         <input id="enabled" type="checkbox" checked />
         Capture chats
@@ -19,6 +19,24 @@
         <button id="clearAll" type="button" class="ghost">Clear</button>
       </div>
     </header>
+
+    <section class="pane">
+      <div class="pane-head">
+        <span>Topos</span>
+        <span id="toposState" class="pill">Not connected</span>
+      </div>
+      <p id="toposDetail" class="fine">
+        Capture stays in this browser. Connect an account to sync new messages to your own Topos.
+      </p>
+      <div class="actions">
+        <button id="toposConnect" type="button">Connect</button>
+        <button id="toposDisconnect" type="button" class="ghost" hidden>Disconnect</button>
+        <button id="toposSendHistory" type="button" class="ghost" hidden>Send history</button>
+      </div>
+      <p id="toposProgress" class="fine" hidden></p>
+      <p id="toposReceipt" class="fine" hidden></p>
+      <p class="fine">The JSONL export can also be imported into Topos as a file.</p>
+    </section>
 
     <section class="pane">
       <div class="pane-head">

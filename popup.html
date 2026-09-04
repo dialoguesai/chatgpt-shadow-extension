@@ -14,6 +14,7 @@
         Capture chats
       </label>
       <p id="status" class="status">Loading…</p>
+      <p id="updateNotice" class="update" hidden></p>
       <div class="actions">
         <button id="exportAll" type="button">Export JSONL</button>
         <button id="clearAll" type="button" class="ghost">Clear</button>
@@ -58,6 +59,7 @@
       <div id="messages" class="thread"></div>
     </section>
 
+    <script src="lib/updateCheck.js"></script>
     <script src="extract.js"></script>
     <script src="store.js"></script>
     <script src="popup.js"></script>

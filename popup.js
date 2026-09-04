@@ -1,5 +1,6 @@
 const enabled = document.getElementById("enabled");
 const status = document.getElementById("status");
+const updateNotice = document.getElementById("updateNotice");
 const threads = document.getElementById("threads");
 const empty = document.getElementById("empty");
 const detail = document.getElementById("detail");
@@ -67,7 +68,13 @@ toposDisconnect.addEventListener("click", () => {
 
 toposSendHistory.addEventListener("click", () => {
   const queued = (topos && topos.queued) || 0;
-  if (!queued) return;
+  if (!queued) {
+    // Nothing to do, but say so — a dead button reads as broken.
+    toposReceipt.hidden = false;
+    toposReceipt.classList.remove("err");
+    toposReceipt.textContent = "Nothing waiting to send. New messages sync on their own once you're connected.";
+    return;
+  }
   if (!window.confirm(`Send ${queued} stored message${queued === 1 ? "" : "s"} to your Topos?`)) return;
   toposSendHistory.disabled = true;
   toposProgress.hidden = false;
@@ -229,8 +236,22 @@ function render() {
     threads.appendChild(button);
   });
 
-  if (!selectedId || !state.messages[selectedId]) {
+  if (!selectedId) {
     detail.hidden = true;
+    return;
+  }
+  // A selected chat with no rows loaded still opens the pane and says so, rather
+  // than leaving the click looking dead.
+  const selectedRows = state.messages[selectedId];
+  if (!selectedRows || selectedRows.length === 0) {
+    detail.hidden = false;
+    const picked = convos.find((row) => row.id === selectedId);
+    detailTitle.textContent = (picked && picked.title) || "Conversation";
+    messages.innerHTML = "";
+    const note = document.createElement("p");
+    note.className = "fine";
+    note.textContent = "No messages stored for this chat yet. Open it in ChatGPT so it can be captured.";
+    messages.appendChild(note);
     return;
   }
   const selected = convos.find((row) => row.id === selectedId);
@@ -268,3 +289,26 @@ function downloadJsonl(threadId) {
     URL.revokeObjectURL(url);
   });
 }
+
+function runUpdateCheck() {
+  if (!updateNotice || typeof ChatGPTShadowUpdateCheck === "undefined") return;
+  let current = "";
+  try {
+    current = chrome.runtime.getManifest().version;
+  } catch {
+    return;
+  }
+  ChatGPTShadowUpdateCheck.check(current).then((result) => {
+    if (!result || !result.updateAvailable) return; // silent when current or on error
+    updateNotice.hidden = false;
+    updateNotice.textContent = `Update available: ${result.current} \u2192 ${result.latest}. `;
+    const link = document.createElement("a");
+    link.href = result.repoUrl;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "Get it";
+    updateNotice.appendChild(link);
+  });
+}
+
+runUpdateCheck();

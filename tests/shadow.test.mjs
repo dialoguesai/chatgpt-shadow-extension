@@ -10,7 +10,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // suite can load every file into one sandbox exactly the way importScripts does.
 const sandbox = { console, crypto, btoa, TextEncoder };
 sandbox.globalThis = sandbox;
-["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposIngest.js"].forEach((file) => {
+["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposIngest.js", "lib/updateCheck.js"].forEach((file) => {
   vm.runInNewContext(fs.readFileSync(path.join(root, file), "utf8"), sandbox);
 });
 
@@ -19,6 +19,7 @@ const Store = sandbox.ChatGPTShadowStore;
 const ToposConfig = sandbox.ChatGPTShadowToposConfig;
 const ToposAuth = sandbox.ChatGPTShadowToposAuth;
 const ToposIngest = sandbox.ChatGPTShadowToposIngest;
+const UpdateCheck = sandbox.ChatGPTShadowUpdateCheck;
 
 function el(attrs = {}, children = [], text = "") {
   const node = {
@@ -518,4 +519,39 @@ test("pkce pairs are S256 and url safe", async () => {
   assert.match(pair.codeChallenge, /^[A-Za-z0-9\-_]+$/);
   const other = await ToposAuth.createPkcePair();
   assert.notEqual(pair.codeVerifier, other.codeVerifier);
+});
+
+test("update check: version comparison is numeric and segment-aware", () => {
+  assert.equal(UpdateCheck.isNewer("0.1.0", "0.2.0"), true);
+  assert.equal(UpdateCheck.isNewer("0.1.0", "0.1.0"), false);
+  assert.equal(UpdateCheck.isNewer("0.2.0", "0.1.9"), false, "0.2.0 is newer than 0.1.9");
+  assert.equal(UpdateCheck.isNewer("1.0", "1.0.1"), true, "a longer newer version wins");
+  assert.equal(UpdateCheck.isNewer("1.10.0", "1.9.0"), false, "10 > 9 numerically, not lexically");
+});
+
+test("update check: a failed fetch never throws and reports the current version", async () => {
+  const savedFetch = sandbox.fetch;
+  sandbox.fetch = async () => {
+    throw new Error("offline");
+  };
+  try {
+    const result = await UpdateCheck.check("0.1.0");
+    assert.equal(result.current, "0.1.0");
+    assert.equal(result.updateAvailable, undefined);
+    assert.ok(result.error, "an error is reported rather than thrown");
+  } finally {
+    sandbox.fetch = savedFetch;
+  }
+});
+
+test("update check: a newer remote manifest is flagged", async () => {
+  const savedFetch = sandbox.fetch;
+  sandbox.fetch = async () => ({ ok: true, json: async () => ({ version: "0.5.0" }) });
+  try {
+    const result = await UpdateCheck.check("0.1.0");
+    assert.equal(result.updateAvailable, true);
+    assert.equal(result.latest, "0.5.0");
+  } finally {
+    sandbox.fetch = savedFetch;
+  }
 });

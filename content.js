@@ -7,6 +7,10 @@
   let debounceTimer = 0;
   let enabled = true;
   let lastFingerprint = "";
+  // Set once the extension is reloaded out from under this injected script
+  // ("Extension context invalidated"): it keeps running in the page but can no
+  // longer reach the worker, so captures silently go nowhere until a tab reload.
+  let contextLost = false;
 
   chrome.storage.local.get({ cs_enabled: true }, (stored) => {
     enabled = stored.cs_enabled !== false;
@@ -93,14 +97,32 @@
   }
 
   function send(payload) {
+    // No runtime id means this injected script was orphaned by an extension
+    // reload. It can never reach the worker again for the life of the page, so
+    // stop pretending capture is live and ask the user to reload the tab.
+    if (!chrome.runtime?.id) {
+      markContextLost();
+      return;
+    }
     try {
-      if (!chrome.runtime?.id) return;
       chrome.runtime.sendMessage(payload, () => {
-        void chrome.runtime.lastError;
+        // "Extension context invalidated" surfaces here, not as a throw.
+        if (chrome.runtime.lastError) markContextLost();
       });
     } catch {
-      // Extension reload mid-page; next scan retries.
+      markContextLost();
     }
+  }
+
+  function markContextLost() {
+    if (contextLost) return;
+    contextLost = true;
+    try {
+      observer.disconnect();
+    } catch {
+      // Already gone.
+    }
+    paintChip();
   }
 
   function paintChip(visibleCount) {
@@ -109,6 +131,12 @@
       chip = document.createElement("div");
       chip.id = "cs-shadow-chip";
       document.documentElement.appendChild(chip);
+    }
+    if (contextLost) {
+      // The count would be a lie — those messages are reaching nothing.
+      chip.textContent = "Shadow \u00b7 reload this tab";
+      chip.dataset.state = "off";
+      return;
     }
     const label = enabled ? "Shadow on" : "Shadow paused";
     const count = Number.isFinite(visibleCount) ? ` · ${visibleCount} on page` : "";

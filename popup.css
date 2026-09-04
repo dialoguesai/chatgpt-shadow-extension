@@ -309,3 +309,8 @@ button[disabled] {
   color: #1a5;
 }
 .update a { color: inherit; font-weight: 600; }
+
+.danger {
+  color: #c00000;
+  border-color: #c00000;
+}

@@ -27,8 +27,28 @@ enabled.addEventListener("change", () => {
 
 exportAll.addEventListener("click", () => downloadJsonl());
 exportOne.addEventListener("click", () => downloadJsonl(selectedId));
+let clearArmed = false;
+let clearArmTimer = 0;
 clearAll.addEventListener("click", () => {
-  if (!window.confirm("Delete every locally stored ChatGPT message?")) return;
+  // Two-click confirm instead of window.confirm(), which would close the popup.
+  // First click arms and relabels; a second click within a few seconds clears.
+  if (!clearArmed) {
+    clearArmed = true;
+    const original = clearAll.textContent;
+    clearAll.textContent = "Click again to clear";
+    clearAll.classList.add("danger");
+    window.clearTimeout(clearArmTimer);
+    clearArmTimer = window.setTimeout(() => {
+      clearArmed = false;
+      clearAll.textContent = original;
+      clearAll.classList.remove("danger");
+    }, 4000);
+    return;
+  }
+  window.clearTimeout(clearArmTimer);
+  clearArmed = false;
+  clearAll.classList.remove("danger");
+  clearAll.textContent = "Clear";
   chrome.runtime.sendMessage({ type: "shadow.clear" }, () => {
     selectedId = "";
     refresh();
@@ -75,7 +95,10 @@ toposSendHistory.addEventListener("click", () => {
     toposReceipt.textContent = "Nothing waiting to send. New messages sync on their own once you're connected.";
     return;
   }
-  if (!window.confirm(`Send ${queued} stored message${queued === 1 ? "" : "s"} to your Topos?`)) return;
+  // No window.confirm(): a modal dialog steals focus, which closes the popup and
+  // kills this handler before the send is ever queued — which read as "nothing
+  // happened". Sending to your own node is not destructive, and the button
+  // already names the count, so the click is the confirmation.
   toposSendHistory.disabled = true;
   toposProgress.hidden = false;
   toposProgress.classList.remove("err");

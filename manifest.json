@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "ChatGPT Shadow",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Copy ChatGPT web chats into local extension storage, and optionally sync them to your own Topos.",
   "permissions": [
     "storage",

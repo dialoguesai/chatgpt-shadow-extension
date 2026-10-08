@@ -1,6 +1,7 @@
 const enabled = document.getElementById("enabled");
 const status = document.getElementById("status");
 const updateNotice = document.getElementById("updateNotice");
+const extractNotice = document.getElementById("extractNotice");
 const threads = document.getElementById("threads");
 const empty = document.getElementById("empty");
 const detail = document.getElementById("detail");
@@ -134,10 +135,18 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.cs_index || changes.cs_messages || changes.cs_enabled) refresh();
   if (Object.keys(changes).some((key) => key.startsWith("cs_topos"))) refreshTopos();
+  if (changes.cs_extract_miss) refreshExtractNotice();
 });
 
 refresh();
 refreshTopos();
+refreshExtractNotice();
+
+function refreshExtractNotice() {
+  chrome.storage.local.get({ cs_extract_miss: null }, (stored) => {
+    extractNotice.hidden = !stored.cs_extract_miss;
+  });
+}
 
 function refresh() {
   chrome.runtime.sendMessage({ type: "shadow.state" }, (next) => {

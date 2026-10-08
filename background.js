@@ -23,6 +23,12 @@ chrome.runtime.onStartup.addListener(() => {
   refreshBadge();
 });
 
+// The content script sets cs_extract_miss while a chat is open but nothing on it
+// reads as a message, so a ChatGPT markup change shows on the badge, not just in-page.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.cs_extract_miss) refreshBadge();
+});
+
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   if (!message || typeof message.type !== "string") return undefined;
 
@@ -130,6 +136,7 @@ async function refreshBadge(state) {
   const stored = await chrome.storage.local.get({
     [TOPOS_KEYS.expired]: false,
     [TOPOS_KEYS.engineWarning]: false,
+    cs_extract_miss: null,
   });
   if (stored[TOPOS_KEYS.expired]) {
     await chrome.action.setBadgeBackgroundColor({ color: "#c00000" });
@@ -139,6 +146,11 @@ async function refreshBadge(state) {
   if (stored[TOPOS_KEYS.engineWarning]) {
     await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
     await chrome.action.setBadgeText({ text: "!" });
+    return;
+  }
+  if (stored.cs_extract_miss && current.enabled !== false) {
+    await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
+    await chrome.action.setBadgeText({ text: "?" });
     return;
   }
   const count = ChatGPTShadowStore.messageCount(current);

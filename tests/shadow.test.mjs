@@ -203,6 +203,11 @@ function t(text) {
 
 function tagMatches(node, selector) {
   if (selector.startsWith(".")) return classNameHas(node, selector.slice(1));
+  const attrSel = selector.match(/^\[([a-z-]+)(?:="([^"]*)")?\]$/);
+  if (attrSel) {
+    const value = node.getAttribute(attrSel[1]);
+    return attrSel[2] == null ? value != null : value === attrSel[2];
+  }
   return String(node.tagName || "").toLowerCase() === selector.toLowerCase();
 }
 
@@ -568,4 +573,92 @@ test("update check: a newer remote manifest is flagged", async () => {
   } finally {
     sandbox.fetch = savedFetch;
   }
+});
+
+// Shape of the ChatGPT front end that shipped late September 2026, taken from a
+// live page: no data-message-author-role; one search unit per message, its key
+// ending in the role, wrapping a div that carries the message and local chat ids.
+function unitDoc(turns, { turnState = "complete" } = {}) {
+  const units = [];
+  turns.forEach((turn, i) => {
+    units.push(
+      h("div", { "data-chatgpt-search-unit-key": `fallback-turn-${i}:0:user`, "data-chatgpt-search-message-ids": turn.userId }, [
+        h("div", { "data-user-message-bubble": "" }, [
+          h("div", { class: "whitespace-pre-wrap" }, [t(turn.user)]),
+          h("button", {}, [t("Edit")]),
+        ]),
+      ])
+    );
+    units.push(
+      h("div", { "data-talvt-turn-state": turnState }, [
+        h("div", {
+          "data-chatgpt-search-unit-key": `fallback-turn-${i}:2:assistant`,
+          "data-chatgpt-search-message-ids": `${turn.assistantId} ${turn.assistantId}`,
+        }, [
+          h("div", {
+            "data-chatgpt-selection-conversation-id": "local-chatgpt:aaaa1111-2222",
+            "data-chatgpt-selection-message-id": turn.assistantId,
+          }, [
+            h("div", { "data-markdown-text-style": "assistant-message" }, [
+              h("p", {}, [t("Answer: "), h("strong", {}, [t(turn.assistant)])]),
+            ]),
+          ]),
+        ]),
+      ])
+    );
+  });
+  const root = h("main", {}, units);
+  root.ownerDocument = root;
+  root.title = "Grant plan - ChatGPT";
+  return root;
+}
+
+test("extracts messages from the search-unit layout", () => {
+  const doc = unitDoc([
+    { userId: "u1", user: "What should the grant cover?", assistantId: "a1", assistant: "staffing" },
+    { userId: "u2", user: "And the timeline?", assistantId: "a2", assistant: "two years" },
+  ]);
+  const rows = Extract.extractMessages(doc);
+  assert.deepEqual(
+    Array.from(rows, (row) => [row.role, row.id, row.content]),
+    [
+      ["user", "u1", "What should the grant cover?"],
+      ["assistant", "a1", "Answer: **staffing**"],
+      ["user", "u2", "And the timeline?"],
+      ["assistant", "a2", "Answer: **two years**"],
+    ]
+  );
+  assert.deepEqual([...Extract.localConversationIdsOnPage(doc)], ["local-chatgpt:aaaa1111-2222"]);
+});
+
+test("turn state marks an unfinished reply as streaming, and only that", () => {
+  const turn = [{ userId: "u1", user: "Hi", assistantId: "a1", assistant: "Hello" }];
+  assert.equal(Extract.isStreaming(unitDoc(turn)), false);
+  assert.equal(Extract.isStreaming(unitDoc(turn, { turnState: "streaming" })), true);
+  // An unknown state must not hold the thread forever.
+  assert.equal(Extract.isStreaming(unitDoc(turn, { turnState: "idle" })), false);
+});
+
+test("a local-chatgpt url is a placeholder, not a conversation id", () => {
+  const href = "https://chatgpt.com/c/local-chatgpt%3Abbbb0000-0000-4000-8000-000000000000";
+  assert.equal(Extract.conversationIdFromUrl(href), "");
+  assert.equal(Extract.localConversationIdFromUrl(href), "local-chatgpt:bbbb0000-0000-4000-8000-000000000000");
+  assert.equal(
+    Extract.localConversationIdFromUrl("https://chatgpt.com/g/g-p-abc123-project/c/11112222-3333-4444-5555-666677778888"),
+    ""
+  );
+  assert.equal(
+    Extract.conversationIdFromUrl("https://chatgpt.com/g/g-p-abc123-project/c/11112222-3333-4444-5555-666677778888?model=x"),
+    "11112222-3333-4444-5555-666677778888"
+  );
+});
+
+test("a local-chatgpt thread is held until it is remapped to the server id", () => {
+  let state = Store.emptyState();
+  state = Store.upsert(state, { id: "pending:local-chatgpt:70a1" }, [
+    { id: "u1", role: "user", content: "Hi", index: 0 },
+  ]);
+  assert.equal(Store.syncScan(state, { includeDerived: true }).held.pending, 1);
+  state = Store.remapThread(state, "pending:local-chatgpt:70a1", "server-id-1");
+  assert.equal(Store.syncScan(state, { includeDerived: true }).records.length, 1);
 });

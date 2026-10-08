@@ -1,12 +1,52 @@
 const ChatGPTShadowExtract = (() => {
   const ROLE_SELECTOR = "[data-message-author-role]";
+  // The late-September 2026 ChatGPT front end dropped data-message-author-role.
+  // Each user or assistant message is now a "search unit" whose key ends in its
+  // role ("fallback-turn-13:2:assistant"), wrapping a div that carries the
+  // message id. Both layouts are read; the old one wins when it is present.
+  const UNIT_SELECTOR = "[data-chatgpt-search-unit-key]";
+  const MESSAGE_ID_ATTR = "data-chatgpt-selection-message-id";
+  const LOCAL_CONVERSATION_ATTR = "data-chatgpt-selection-conversation-id";
   const STOP_BUTTON = '[data-testid="stop-button"]';
-  const THREAD_RE = /\/(?:c|share)\/([a-z0-9-]+)/i;
+  const TURN_STATE_SELECTOR = "[data-talvt-turn-state]";
+  const THREAD_RE = /\/(?:c|share)\/([a-z0-9-]+)(?=[/?#]|$)/i;
+  // A chat ChatGPT has not saved yet lives at /c/local-chatgpt:<uuid> until the
+  // server id arrives. The id is a client-side placeholder, never a real thread.
+  const LOCAL_THREAD_RE = /\/c\/(local-chatgpt:[a-z0-9-]+)/i;
   const SKIP_TAGS = new Set(["button", "svg", "script", "style", "noscript", "nav", "input", "textarea"]);
 
+  function decodedHref(href) {
+    const raw = String(href || "");
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+
   function conversationIdFromUrl(href) {
-    const match = String(href || "").match(THREAD_RE);
+    const match = decodedHref(href).match(THREAD_RE);
     return match ? match[1] : "";
+  }
+
+  /** The local-chatgpt:<uuid> placeholder from the URL, or "" for a saved chat. */
+  function localConversationIdFromUrl(href) {
+    const match = decodedHref(href).match(LOCAL_THREAD_RE);
+    return match ? match[1] : "";
+  }
+
+  /**
+   * Local placeholder ids the rendered messages still carry. A chat started on
+   * this page keeps them after the URL moves to the server id, which is what ties
+   * the placeholder to the real conversation.
+   */
+  function localConversationIdsOnPage(root) {
+    const ids = new Set();
+    root.querySelectorAll(`[${LOCAL_CONVERSATION_ATTR}]`).forEach((node) => {
+      const value = attr(node, LOCAL_CONVERSATION_ATTR);
+      if (value.startsWith("local-chatgpt:")) ids.add(value);
+    });
+    return Array.from(ids);
   }
 
   function conversationTitleFromPageTitle(title) {
@@ -218,11 +258,18 @@ const ChatGPTShadowExtract = (() => {
 
   function isStreaming(root) {
     const doc = root.ownerDocument || root;
-    return Boolean(doc.querySelector(STOP_BUTTON));
+    if (doc.querySelector(STOP_BUTTON)) return true;
+    // Only "complete" has been observed. Match the in-flight names loosely rather
+    // than treating every non-complete value as streaming: a false "streaming"
+    // holds the thread forever, a false "settled" only costs one resend.
+    return Array.from(doc.querySelectorAll(TURN_STATE_SELECTOR)).some((node) =>
+      /stream|progress|pending|generat|running/i.test(attr(node, "data-talvt-turn-state"))
+    );
   }
 
   function extractMessages(root) {
     const nodes = root.querySelectorAll(ROLE_SELECTOR);
+    if (!nodes.length) return extractUnitMessages(root);
     const messages = [];
     nodes.forEach((el, index) => {
       const role = String(el.getAttribute("data-message-author-role") || "").toLowerCase();
@@ -236,6 +283,58 @@ const ChatGPTShadowExtract = (() => {
         content,
         index,
       });
+    });
+    return messages;
+  }
+
+  function unitRole(unit) {
+    const key = attr(unit, "data-chatgpt-search-unit-key");
+    const suffix = key.match(/:(user|assistant)$/i);
+    if (suffix) return suffix[1].toLowerCase();
+    const tagged = attr(unit, "data-conversation-role") ||
+      attr(unit.querySelector && unit.querySelector("[data-conversation-role]"), "data-conversation-role");
+    if (tagged) return tagged.toLowerCase();
+    if (unit.querySelector && unit.querySelector("[data-user-message-bubble]")) return "user";
+    return "";
+  }
+
+  function unitMessageId(unit) {
+    const own = attr(unit, MESSAGE_ID_ATTR) ||
+      attr(unit.querySelector && unit.querySelector(`[${MESSAGE_ID_ATTR}]`), MESSAGE_ID_ATTR);
+    if (own) return own;
+    return attr(unit, "data-chatgpt-search-message-ids").trim().split(/\s+/)[0] || "";
+  }
+
+  function unitText(unit, role) {
+    const roots = unit.querySelectorAll ? Array.from(unit.querySelectorAll("[data-markdown-text-style]")) : [];
+    if (roots.length) {
+      return cleanChrome(roots.map((node) => htmlToMarkdown(node) || textOf(node)).join("\n\n"));
+    }
+    if (role === "user" && unit.querySelector) {
+      const bubble = unit.querySelector("[data-user-message-bubble]");
+      if (bubble) {
+        const body = bubble.querySelector(".whitespace-pre-wrap") || bubble;
+        return cleanChrome(textOf(body));
+      }
+    }
+    return extractMessageText(unit);
+  }
+
+  function isNestedUnit(unit) {
+    const parent = unit.parentElement;
+    return Boolean(parent && typeof parent.closest === "function" && parent.closest(UNIT_SELECTOR));
+  }
+
+  function extractUnitMessages(root) {
+    const messages = [];
+    Array.from(root.querySelectorAll(UNIT_SELECTOR)).forEach((unit, index) => {
+      if (isNestedUnit(unit)) return;
+      const role = unitRole(unit);
+      if (role !== "user" && role !== "assistant") return;
+      const content = unitText(unit, role);
+      const id = unitMessageId(unit);
+      if (!content || isPlaceholderMessage(id, content)) return;
+      messages.push({ id, role, content, index });
     });
     return messages;
   }
@@ -426,7 +525,10 @@ const ChatGPTShadowExtract = (() => {
 
   return {
     ROLE_SELECTOR,
+    UNIT_SELECTOR,
     conversationIdFromUrl,
+    localConversationIdFromUrl,
+    localConversationIdsOnPage,
     conversationTitleFromPageTitle,
     extractTitle,
     extractMessageText,

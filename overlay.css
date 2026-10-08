@@ -15,3 +15,9 @@
 #cs-shadow-chip[data-state="off"] {
   color: #777;
 }
+
+#cs-shadow-chip[data-state="warn"] {
+  color: #7a4b00;
+  background: #fff3d6;
+  border-color: #e7c27a;
+}

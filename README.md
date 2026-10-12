@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icons/icon-48.png" alt="ChatGPT Shadow" width="96" height="96" />
+  <img src="icons/icon-128.png" alt="ChatGPT Shadow" width="96" height="96" />
 </p>
 
 <h1 align="center">ChatGPT Shadow</h1>
@@ -213,7 +213,7 @@ node --test tests/shadow.test.mjs
 
 Every file is a classic script that assigns itself to `globalThis`; the service worker loads them with `importScripts` and the test suite loads the same files into one `vm` sandbox. There is no bundler and no ES module in the extension.
 
-Selectors stay in `extract.js` so a ChatGPT redesign is a one-file patch. The decision about which stored rows may leave the machine lives in one function, `ChatGPTShadowStore.syncScan`. Icons can be regenerated with `python3 scripts/make-icons.py`.
+Selectors stay in `extract.js` so a ChatGPT redesign is a one-file patch. The decision about which stored rows may leave the machine lives in one function, `ChatGPTShadowStore.syncScan`. Icons are generated from the supplied transparent artwork in `icons/icon-source.png`. Install Pillow (`python3 -m pip install Pillow`), then run `python3 scripts/make-icons.py` to regenerate the 16, 32, 48, and 128 px toolbar and extension icons.
 
 ---
 

@@ -110,7 +110,7 @@ Optional. Nothing below happens until you press **Connect**.
 3. Everything captured *before* you connected stays local until you press **Send history**. The button shows the count first, sends in batches of at most 200 records, and reports how many were written and how many were queued for a node that is currently offline.
 4. **Disconnect** deletes the token and stops all sending. Your local copy is untouched.
 
-Records are sent to `POST /v1/ingestion/app_ingest` with the same five fields as the JSONL export. A record is keyed on its message id, so a resend replaces rather than duplicates.
+Records are sent to `POST /v1/ingestion/app_ingest` in the same shape as the JSONL export. A record is keyed on its message id, so a resend replaces rather than duplicates.
 
 Three kinds of message are never sent automatically:
 
@@ -145,13 +145,16 @@ Each JSONL line is one turn:
   "thread_id": "conversation-id",
   "role": "user",
   "content": "markdown or plain text",
-  "created_at": 1700000000
+  "created_at": 1700000000,
+  "_metadata": { "conversation_title": "the chat's title" }
 }
 ```
 
 Assistant `content` is markdown, not flattened text. `created_at` is a Unix timestamp in seconds.
 
-This field set is frozen: the exported file and the records sent to Topos are built by the same function, so a file import and a sync produce the same rows.
+`_metadata.conversation_title` is the chat's title as ChatGPT shows it in the sidebar. It is left out until ChatGPT has named the chat ("New chat" and similar placeholders are never sent), so the first turns of a new chat may carry none. Topos keeps the latest title it receives for each chat.
+
+The five turn fields are frozen: the exported file and the records sent to Topos are built by the same function, so a file import and a sync produce the same rows.
 
 ---
 

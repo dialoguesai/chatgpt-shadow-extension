@@ -487,11 +487,25 @@ test("records sent to Topos carry the same frozen field set as the JSONL export"
   ]);
   const wire = Store.selectUnsynced(state, HISTORY)[0];
   const exported = JSON.parse(Store.toJsonl(state).split("\n")[0]);
-  assert.deepEqual(list(Object.keys(wire)), ["id", "thread_id", "role", "content", "created_at"]);
-  assert.deepEqual(plain(wire), exported);
+  assert.deepEqual(list(Object.keys(wire)), ["id", "thread_id", "role", "content", "created_at", "_metadata"]);
+  assert.deepEqual(plain(wire._metadata), { conversation_title: "Sample thread" });
+  // Compared as sent: JSON, so the sandbox's object prototypes do not count.
+  assert.deepEqual(JSON.parse(JSON.stringify(wire)), exported);
   // Sync bookkeeping never reaches the wire or the export file.
   assert.equal("synced_at" in wire, false);
   assert.equal("id_source" in wire, false);
+});
+
+test("a placeholder title never reaches the wire, and the thread's latest title does", () => {
+  const row = { id: "msg-0015", role: "user", content: "sample question", index: 0, created_at: 1700000000 };
+  for (const title of ["New chat", "ChatGPT", "Untitled", "  "]) {
+    const wire = Store.selectUnsynced(seed("conv-0013", [row], { title }), HISTORY)[0];
+    assert.equal("_metadata" in wire, false, title);
+  }
+  // ChatGPT names a thread after its first reply; rows sent after that carry the name.
+  let state = seed("conv-0014", [row], { title: "New chat" });
+  state = Store.upsert(state, { id: "conv-0014", title: "Retention charts" }, []);
+  assert.equal(Store.selectUnsynced(state, HISTORY)[0]._metadata.conversation_title, "Retention charts");
 });
 
 test("the ingest idempotency key is stable per batch and moves when content changes", () => {

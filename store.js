@@ -131,18 +131,31 @@ const ChatGPTShadowStore = (() => {
     return Object.values(state.messages || {}).reduce((sum, rows) => sum + (Array.isArray(rows) ? rows.length : 0), 0);
   }
 
+  // What the page shows before ChatGPT names a thread. Not a title, so never sent as one.
+  const PLACEHOLDER_TITLES = new Set(["untitled", "new chat", "chatgpt"]);
+
+  function conversationTitle(state, threadId) {
+    const meta = (state.index || {})[threadId];
+    const title = String((meta && meta.title) || "").trim();
+    return title && !PLACEHOLDER_TITLES.has(title.toLowerCase()) ? title : "";
+  }
+
   /**
    * The one record shape this extension emits. The JSONL export and the Topos
-   * write path share it so they cannot drift; the field set is frozen.
+   * write path share it so they cannot drift. The v1 fields are frozen; the
+   * thread's title rides in `_metadata.conversation_title`, the key the engine's
+   * ChatGPT parser already passes through, and is absent while the thread has none.
    */
-  function toWireRecord(row, threadId) {
-    return {
+  function toWireRecord(row, threadId, title) {
+    const record = {
       id: row.id,
       thread_id: row.thread_id || threadId,
       role: row.role,
       content: row.content,
       created_at: row.created_at,
     };
+    if (title) record._metadata = { conversation_title: title };
+    return record;
   }
 
   function toJsonl(state, threadId) {
@@ -151,7 +164,7 @@ const ChatGPTShadowStore = (() => {
     ids.forEach((id) => {
       const rows = state.messages[id] || [];
       rows.forEach((row) => {
-        lines.push(JSON.stringify(toWireRecord(row, id)));
+        lines.push(JSON.stringify(toWireRecord(row, id, conversationTitle(state, id))));
       });
     });
     return lines.join("\n");
@@ -224,7 +237,7 @@ const ChatGPTShadowStore = (() => {
           held.beforeBaseline += 1;
           return;
         }
-        records.push(toWireRecord(row, threadId));
+        records.push(toWireRecord(row, threadId, conversationTitle(state, threadId)));
       });
     });
 

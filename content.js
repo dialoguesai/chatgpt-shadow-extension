@@ -66,6 +66,10 @@
     }
 
     const extracted = ChatGPTShadowExtract.extractMessages(document);
+    // The ids these messages were stored under in the placeholder thread: ChatGPT's
+    // own id, or the content-hash id the store derived under that placeholder.
+    const idsOnPage = (fromId) =>
+      extracted.map((row) => ChatGPTShadowExtract.toV1Record(fromId, row, 0).id).filter(Boolean);
     noteExtractHealth(extracted.length);
     paintChip(extracted.length);
     if (!enabled || !extracted.length) return;
@@ -82,7 +86,9 @@
         !pendingLocal.startsWith("local-chatgpt:") ||
         pendingLocal === lastUrlLocalId ||
         ChatGPTShadowExtract.localConversationIdsOnPage(document).includes(pendingLocal);
-      if (sameChat) send({ type: "shadow.remap", fromId: pendingThreadId, toId: urlId });
+      // Only the messages on the page move. An anonymous placeholder can also hold
+      // stale rows from a page seen earlier; those stay parked and are never sent.
+      if (sameChat) send({ type: "shadow.remap", fromId: pendingThreadId, toId: urlId, ids: idsOnPage(pendingThreadId) });
       pendingThreadId = "";
     }
     if (!urlId) {
@@ -90,7 +96,7 @@
         const next = `${PENDING_PREFIX}${urlLocalId}`;
         // A new chat typed at chatgpt.com/ first, then given its local URL.
         if (pendingThreadId && !pendingThreadId.startsWith(`${PENDING_PREFIX}local-chatgpt:`)) {
-          send({ type: "shadow.remap", fromId: pendingThreadId, toId: next });
+          send({ type: "shadow.remap", fromId: pendingThreadId, toId: next, ids: idsOnPage(pendingThreadId) });
         }
         pendingThreadId = next;
       } else if (!pendingThreadId) {

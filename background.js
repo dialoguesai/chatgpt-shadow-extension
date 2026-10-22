@@ -15,13 +15,35 @@ let autoSyncDirty = false;
 /** Set after a failed send so the automatic path does not hammer a slow node. */
 let nextAutoSyncAt = 0;
 
+const REPAIR_RECEIPT_KEY = "cs_repair_receipt";
+
 chrome.runtime.onInstalled.addListener(() => {
-  refreshBadge();
+  repairStore().finally(() => refreshBadge());
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  refreshBadge();
+  repairStore().finally(() => refreshBadge());
 });
+
+/**
+ * Remove copies of a message filed under a second chat, and mark the rows whose
+ * correction the node still needs. Idempotent, so it runs on every install and
+ * startup. Nothing is sent from here: corrections wait for Fix chat links.
+ * The receipt holds counts only.
+ */
+function repairStore() {
+  let summary = { repaired: 0, removed: 0 };
+  return applyChange((state) => {
+    const result = ChatGPTShadowStore.repairThreadIds(state);
+    summary = { repaired: result.repaired, removed: result.removed };
+    return result.state;
+  })
+    .then(() => {
+      if (!summary.repaired && !summary.removed) return undefined;
+      return chrome.storage.local.set({ [REPAIR_RECEIPT_KEY]: { ...summary, at: Date.now() } });
+    })
+    .catch(() => {});
+}
 
 // The content script sets cs_extract_miss while a chat is open but nothing on it
 // reads as a message, so a ChatGPT markup change shows on the badge, not just in-page.
@@ -44,7 +66,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "shadow.remap") {
-    applyChange((state) => ChatGPTShadowStore.remapThread(state, message.fromId, message.toId)).then(() => {
+    applyChange((state) =>
+      ChatGPTShadowStore.remapThread(state, message.fromId, message.toId, {
+        ids: Array.isArray(message.ids) ? message.ids : undefined,
+      })
+    ).then(() => {
       sendResponse({ ok: true });
       // The pending: rows just became addressable under the real conversation id.
       scheduleAutoSync();
@@ -104,6 +130,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   // User-initiated only. Sends every unsynced row, including content-hash ids.
   if (message.type === "topos.submitHistory") {
     queueSync("history").then(sendResponse);
+    return true;
+  }
+
+  // User-initiated only. Resends just the rows whose thread id was corrected.
+  if (message.type === "topos.submitRepair") {
+    queueSync("repair").then(sendResponse);
     return true;
   }
 
@@ -175,11 +207,22 @@ function broadcast(payload) {
 function autoOptions(auth) {
   // Automatic path: real message ids only, and only what was captured after the
   // account was attached. Anything older is backlog for the history button.
-  return { includeDerived: false, since: auth.baselineAt || 0, skipStreaming: true };
+  // Thread-id corrections rewrite rows the node already holds: never automatic.
+  return { includeDerived: false, since: auth.baselineAt || 0, skipStreaming: true, repair: "hold" };
 }
 
 function historyOptions() {
-  return { includeDerived: true, since: 0, skipStreaming: true };
+  return { includeDerived: true, since: 0, skipStreaming: true, repair: "include" };
+}
+
+function repairOptions() {
+  return { includeDerived: true, since: 0, skipStreaming: true, repair: "only" };
+}
+
+function optionsFor(mode, auth) {
+  if (mode === "history") return historyOptions();
+  if (mode === "repair") return repairOptions();
+  return autoOptions(auth);
 }
 
 async function toposStatus() {
@@ -187,6 +230,7 @@ async function toposStatus() {
   const state = await readState();
   const history = ChatGPTShadowStore.syncScan(state, historyOptions());
   const auto = ChatGPTShadowStore.syncScan(state, autoOptions(auth));
+  const repair = ChatGPTShadowStore.syncScan(state, repairOptions());
   return {
     connected: auth.connected,
     expired: auth.expired,
@@ -197,6 +241,7 @@ async function toposStatus() {
     baselineAt: auth.baselineAt,
     queued: history.records.length,
     queuedNew: auto.records.length,
+    repairQueued: repair.records.length,
     held: history.held,
     synced: history.synced,
     receipt: auth.receipt,
@@ -276,6 +321,7 @@ function describeFailure(result) {
 /**
  * mode "auto"    new messages captured since the account was attached
  * mode "history" everything unsynced, user-initiated only
+ * mode "repair"  only the thread-id corrections, user-initiated only
  */
 async function runSync(mode) {
   const auth = await ToposAuth.read();
@@ -290,7 +336,7 @@ async function runSync(mode) {
   }
 
   const state = await readState();
-  const scan = ChatGPTShadowStore.syncScan(state, mode === "history" ? historyOptions() : autoOptions(auth));
+  const scan = ChatGPTShadowStore.syncScan(state, optionsFor(mode, auth));
   const total = scan.records.length;
   if (!total) return { mode, total: 0, landed: 0, queued: 0, failed: 0, held: scan.held };
 

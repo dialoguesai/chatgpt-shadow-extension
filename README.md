@@ -112,13 +112,21 @@ Optional. Nothing below happens until you press **Connect**.
 
 Records are sent to `POST /v1/ingestion/app_ingest` in the same shape as the JSONL export. A record is keyed on its message id, so a resend replaces rather than duplicates.
 
-Three kinds of message are never sent automatically:
+Four kinds of message are never sent automatically:
 
 | Held | Why |
 |------|-----|
 | A chat with no conversation id yet | The thread id is a local `pending:` placeholder. Sending it would file records under an id that never becomes real. Released once the URL supplies the real id. |
 | A message with no id in the page | The id had to be derived from a content hash, so it changes when the message is edited and would write twice. It goes only through **Send history**. |
 | A reply still streaming | Sent once the reply settles, so the stored text is the final text. |
+| A correction for a message filed under the wrong chat | Sent only by **Fix chat links** (or **Send history**). It rewrites a row your node already holds, so it never goes on its own. |
+
+Two rules decide what counts as a new or changed message:
+
+- **One message id belongs to one chat, the first one it was captured in.** The same message seen under another URL (a `/share/` copy, a branched chat, or the page still showing the previous chat while the URL has moved on) is ignored, so it is never sent under a second chat. A chat with no id yet only takes the messages on the page when its real id appears.
+- **Whitespace-only recaptures are not edits.** Text is compared with runs of whitespace collapsed, and stored exactly as captured. A recapture that differs only in spacing or line breaks keeps the stored text and is not resent; any other change is.
+
+Versions before 0.2.3 could file a message under a second chat. On install and on browser start the extension removes those copies and, where the wrong chat id is what your node last received, queues one correction per message. The popup then shows **Fix chat links (N)**; pressing it resends those messages with the right chat id and the text your node already holds.
 
 If a send fails because your node is slow or unreachable, the records stay queued in the extension and go out on a later attempt. If the token is rejected, it is deleted, the toolbar badge turns red, and nothing more is sent until you connect again.
 
@@ -230,4 +238,4 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ## Version
 
-**0.1.0** — ChatGPT Shadow (Manifest V3)
+**0.2.3** — ChatGPT Shadow (Manifest V3). One chat per message id, whitespace-only recaptures are not edits, and **Fix chat links** for messages earlier versions filed under the wrong chat.

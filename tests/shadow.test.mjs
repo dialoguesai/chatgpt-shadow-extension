@@ -662,3 +662,365 @@ test("a local-chatgpt thread is held until it is remapped to the server id", () 
   state = Store.remapThread(state, "pending:local-chatgpt:70a1", "server-id-1");
   assert.equal(Store.syncScan(state, { includeDerived: true }).records.length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// One thread per message id, whitespace-only recaptures, and the one-time repair.
+// Every fixture id below is synthetic.
+// ---------------------------------------------------------------------------
+
+const REPAIR_ONLY = { includeDerived: true, since: 0, skipStreaming: true, repair: "only" };
+const HISTORY_ALL = { ...HISTORY, repair: "include" };
+const json = (value) => JSON.parse(JSON.stringify(value));
+const ids = (rows) => list((rows || []).map((row) => row.id));
+
+function stored(messages, index = {}) {
+  const idx = { ...index };
+  Object.keys(messages).forEach((key) => {
+    if (!idx[key]) idx[key] = { id: key, title: "Sample thread", messageCount: messages[key].length, streaming: false };
+  });
+  return { enabled: true, index: idx, messages };
+}
+
+test("a message id stored under one chat is not copied into another", () => {
+  let state = seed("conv-0101", [
+    { id: "msg-0101", role: "user", content: "sample question", index: 0, created_at: 1700000000 },
+  ]);
+  state = Store.markSynced(state, Store.selectUnsynced(state, HISTORY), 1700000100);
+  state = Store.upsert(state, { id: "conv-0102", title: "Other thread" }, [
+    { id: "msg-0101", role: "user", content: "sample question", index: 0, created_at: 1700000200 },
+    { id: "msg-0102", role: "assistant", content: "sample answer", index: 1, created_at: 1700000201 },
+  ]);
+  assert.deepEqual(ids(state.messages["conv-0102"]), ["msg-0102"]);
+  const home = state.messages["conv-0101"][0];
+  assert.equal(home.thread_id, "conv-0101");
+  assert.equal(home.synced_at, 1700000100);
+  assert.deepEqual(ids(Store.syncScan(state, HISTORY).records), ["msg-0102"]);
+});
+
+test("a /share/ copy does not re-home stored messages", () => {
+  let state = seed("conv-0103", [
+    { id: "msg-0103", role: "user", content: "sample question", index: 0, created_at: 1700000000 },
+  ]);
+  state = Store.markSynced(state, Store.selectUnsynced(state, HISTORY), 1700000100);
+  state = Store.upsert(state, { id: "share-0103", url: "https://chatgpt.com/share/share-0103" }, [
+    { id: "msg-0103", role: "user", content: "sample question", index: 0, created_at: 1700000300 },
+  ]);
+  assert.equal(state.messages["share-0103"], undefined);
+  assert.equal(state.index["share-0103"], undefined);
+  assert.equal(Store.selectUnsynced(state, HISTORY_ALL).length, 0);
+});
+
+test("whitespace-only recapture is not an edit and keeps the stored bytes", () => {
+  const original = "Hello  world\n\n- x";
+  let state = seed("conv-0104", [{ id: "msg-0104", role: "assistant", content: original, index: 0, created_at: 1700000000 }]);
+  state = Store.markSynced(state, Store.selectUnsynced(state, HISTORY), 1700000100);
+  const before = state.messages["conv-0104"][0];
+  state = Store.upsert(state, { id: "conv-0104" }, [
+    { id: "msg-0104", role: "assistant", content: " Hello world\n- x ", index: 0, created_at: 1700000000 },
+  ]);
+  const after = state.messages["conv-0104"][0];
+  assert.equal(after.synced_at, 1700000100);
+  assert.equal(after.content, original);
+  assert.equal(after.updated_at, before.updated_at);
+  assert.equal(Store.selectUnsynced(state, HISTORY).length, 0);
+  // NBSP and the other Unicode spaces count as whitespace too.
+  assert.equal(Store.normalizeForCompare("a  b\t\r\n"), "a b");
+  assert.equal(Store.normalizeForCompare(undefined), "");
+});
+
+test("a real edit with whitespace noise still resends, stored as captured", () => {
+  let state = seed("conv-0105", [{ id: "msg-0105", role: "assistant", content: "Hello  world", index: 0, created_at: 1700000000 }]);
+  state = Store.markSynced(state, Store.selectUnsynced(state, HISTORY), 1700000100);
+  state = Store.upsert(state, { id: "conv-0105" }, [
+    { id: "msg-0105", role: "assistant", content: " Hello brave world ", index: 0, created_at: 1700000000 },
+  ]);
+  const row = state.messages["conv-0105"][0];
+  assert.equal(row.synced_at, undefined);
+  assert.equal(row.content, " Hello brave world ");
+  assert.deepEqual(list(Store.selectUnsynced(state, HISTORY).map((r) => r.content)), [" Hello brave world "]);
+});
+
+test("upsert never rewrites a stored real thread_id", () => {
+  let state = stored({
+    "conv-0106": [{ id: "msg-0106", thread_id: "conv-0106", role: "user", content: "sample", created_at: 1700000000, synced_at: 1700000001 }],
+  });
+  state = Store.upsert(state, { id: "conv-0106" }, [
+    { id: "msg-0106", role: "user", content: "sample, revised", index: 0, created_at: 1700000000 },
+  ]);
+  assert.equal(state.messages["conv-0106"][0].thread_id, "conv-0106");
+  assert.equal(state.messages["conv-0106"][0].synced_at, undefined);
+
+  // A row under a real key still carrying a pending thread_id resolves to the key.
+  let pendingCarried = stored({
+    "conv-0107": [{ id: "msg-0107", thread_id: "pending:1700000002", role: "user", content: "sample", created_at: 1700000002 }],
+  });
+  assert.equal(Store.syncScan(pendingCarried, HISTORY).held.pending, 1);
+  pendingCarried = Store.upsert(pendingCarried, { id: "conv-0107" }, [
+    { id: "msg-0107", role: "user", content: "sample", index: 0, created_at: 1700000002 },
+  ]);
+  assert.equal(pendingCarried.messages["conv-0107"][0].thread_id, "conv-0107");
+});
+
+test("a parked pending row moves to the real thread when it is captured there, keeping its fields", () => {
+  let state = seed("pending:1700000300", [
+    { id: "msg-0108", role: "user", content: "sample question", index: 0, created_at: 1700000300 },
+  ]);
+  state = Store.upsert(state, { id: "conv-0108" }, [
+    { id: "msg-0108", role: "user", content: "sample question", index: 0, created_at: 1700000999 },
+  ]);
+  assert.equal(state.messages["pending:1700000300"], undefined);
+  assert.equal(state.index["pending:1700000300"], undefined);
+  const row = state.messages["conv-0108"][0];
+  assert.equal(row.thread_id, "conv-0108");
+  assert.equal(row.created_at, 1700000300);
+  // And a pending thread never takes an id a real thread already holds.
+  state = Store.upsert(state, { id: "pending:1700000400" }, [
+    { id: "msg-0108", role: "user", content: "sample question", index: 0, created_at: 1700000400 },
+  ]);
+  assert.equal(state.messages["pending:1700000400"], undefined);
+});
+
+test("remap carries only ids on the page", () => {
+  let state = stored({
+    "conv-0110": [{ id: "msg-0001", thread_id: "conv-0110", role: "user", content: "stored", created_at: 1700000000, synced_at: 1700000001 }],
+    "pending:1700000000": [
+      { id: "msg-0001", thread_id: "pending:1700000000", role: "user", content: "stored", created_at: 1700000005 },
+      { id: "msg-0008", thread_id: "pending:1700000000", role: "user", content: "stale", created_at: 1700000006 },
+      { id: "msg-0009", thread_id: "pending:1700000000", role: "user", content: "on page", created_at: 1700000007 },
+    ],
+  });
+  state = Store.remapThread(state, "pending:1700000000", "conv-0111", { ids: ["msg-0009"] });
+  assert.deepEqual(ids(state.messages["conv-0111"]), ["msg-0009"]);
+  assert.equal(state.messages["conv-0111"][0].thread_id, "conv-0111");
+  assert.deepEqual(ids(state.messages["pending:1700000000"]), ["msg-0008"]);
+  assert.equal(state.index["pending:1700000000"].messageCount, 1);
+  assert.equal(state.messages["conv-0110"][0].synced_at, 1700000001);
+  const scan = Store.syncScan(state, HISTORY_ALL);
+  assert.equal(scan.held.pending, 1);
+  assert.deepEqual(ids(scan.records), ["msg-0009"]);
+});
+
+test("remap without ids moves every row except copies of stored rows", () => {
+  let state = stored({
+    "conv-0112": [{ id: "msg-0112", thread_id: "conv-0112", role: "user", content: "stored", created_at: 1700000000 }],
+    "pending:1700000010": [
+      { id: "msg-0112", thread_id: "pending:1700000010", role: "user", content: "stored", created_at: 1700000010 },
+      { id: "msg-0113", thread_id: "pending:1700000010", role: "user", content: "new", created_at: 1700000011 },
+    ],
+  });
+  state = Store.remapThread(state, "pending:1700000010", "conv-0113");
+  assert.deepEqual(ids(state.messages["conv-0113"]), ["msg-0113"]);
+  assert.deepEqual(ids(state.messages["conv-0112"]), ["msg-0112"]);
+  assert.equal(state.messages["pending:1700000010"], undefined);
+  assert.equal(state.index["pending:1700000010"], undefined);
+});
+
+test("repair removes the wrong copy and marks the home row when the wrong copy was sent last", () => {
+  const state = stored({
+    "conv-A": [{ id: "msg-0001", thread_id: "conv-A", role: "assistant", content: "x y", created_at: 100, synced_at: 200 }],
+    "conv-B": [{ id: "msg-0001", thread_id: "conv-B", role: "assistant", content: "x  y", created_at: 300, synced_at: 400 }],
+  });
+  const result = Store.repairThreadIds(state);
+  assert.equal(result.repaired, 1);
+  assert.equal(result.removed, 1);
+  const next = result.state;
+  assert.equal(next.messages["conv-B"], undefined);
+  assert.equal(next.index["conv-B"], undefined);
+  const home = next.messages["conv-A"][0];
+  assert.equal(home.thread_id, "conv-A");
+  assert.equal(home.synced_at, undefined);
+  assert.equal(home.repair, "thread_id");
+  assert.equal(home.content, "x  y");
+  assert.equal(next.index["conv-A"].messageCount, 1);
+  // Held on the automatic path, sent only by the repair-only scan.
+  const auto = Store.syncScan(next, AUTO);
+  assert.equal(auto.held.repair, 1);
+  assert.equal(auto.records.length, 0);
+  assert.deepEqual(json(Store.syncScan(next, REPAIR_ONLY).records), [
+    { id: "msg-0001", thread_id: "conv-A", role: "assistant", content: "x  y", created_at: 100, _metadata: { conversation_title: "Sample thread" } },
+  ]);
+  // The input is untouched.
+  assert.equal(state.messages["conv-B"].length, 1);
+  assert.equal(state.messages["conv-A"][0].synced_at, 200);
+});
+
+test("repair leaves the home row alone when it was sent after the wrong copy", () => {
+  const state = stored({
+    "conv-A": [{ id: "msg-0002", thread_id: "conv-A", role: "user", content: "sample", created_at: 100, synced_at: 500 }],
+    "conv-B": [{ id: "msg-0002", thread_id: "conv-B", role: "user", content: "sample", created_at: 300, synced_at: 400 }],
+  });
+  const result = Store.repairThreadIds(state);
+  assert.equal(result.repaired, 0);
+  assert.equal(result.removed, 1);
+  assert.equal(result.state.messages["conv-B"], undefined);
+  const home = result.state.messages["conv-A"][0];
+  assert.equal(home.synced_at, 500);
+  assert.equal("repair" in home, false);
+});
+
+test("repair leaves an unsent wrong copy's home row to the normal send", () => {
+  const state = stored({
+    "conv-A": [{ id: "msg-0003", thread_id: "conv-A", role: "user", content: "sample", created_at: 100, synced_at: 150 }],
+    "conv-B": [{ id: "msg-0003", thread_id: "conv-B", role: "user", content: "sample", created_at: 300 }],
+  });
+  const result = Store.repairThreadIds(state);
+  assert.equal(result.repaired, 0);
+  assert.equal(result.removed, 1);
+  assert.equal(result.state.messages["conv-A"][0].synced_at, 150);
+});
+
+test("repair tie-break is deterministic", () => {
+  // Equal created_at: the earlier synced_at is home.
+  let result = Store.repairThreadIds(stored({
+    "conv-B": [{ id: "msg-0004", thread_id: "conv-B", role: "user", content: "b", created_at: 100, synced_at: 300 }],
+    "conv-A": [{ id: "msg-0004", thread_id: "conv-A", role: "user", content: "a", created_at: 100, synced_at: 200 }],
+  }));
+  assert.deepEqual(Object.keys(result.state.messages), ["conv-A"]);
+  assert.equal(result.repaired, 1);
+  assert.equal(result.state.messages["conv-A"][0].content, "b");
+
+  // Equal created_at, one unsynced: the synced copy is home.
+  result = Store.repairThreadIds(stored({
+    "conv-A": [{ id: "msg-0005", thread_id: "conv-A", role: "user", content: "a", created_at: 100 }],
+    "conv-B": [{ id: "msg-0005", thread_id: "conv-B", role: "user", content: "b", created_at: 100, synced_at: 300 }],
+  }));
+  assert.deepEqual(Object.keys(result.state.messages), ["conv-B"]);
+  assert.equal(result.repaired, 0);
+
+  // Equal again: the lexically lower key is home, and an equal synced_at resends (>=).
+  result = Store.repairThreadIds(stored({
+    "conv-B": [{ id: "msg-0006", thread_id: "conv-B", role: "user", content: "b", created_at: 100, synced_at: 300 }],
+    "conv-A": [{ id: "msg-0006", thread_id: "conv-A", role: "user", content: "a", created_at: 100, synced_at: 300 }],
+  }));
+  assert.deepEqual(Object.keys(result.state.messages), ["conv-A"]);
+  assert.equal(result.repaired, 1);
+  assert.equal(result.state.messages["conv-A"][0].repair, "thread_id");
+});
+
+test("repair is idempotent", () => {
+  const state = stored({
+    "conv-A": [
+      { id: "msg-0007", thread_id: "conv-A", role: "user", content: "x", created_at: 100, synced_at: 200 },
+      { id: "msg-0008", thread_id: "conv-Z", role: "user", content: "y", created_at: 101, synced_at: 201 },
+    ],
+    "conv-B": [{ id: "msg-0007", thread_id: "conv-B", role: "user", content: "x", created_at: 300, synced_at: 400 }],
+    "pending:1700000000": [{ id: "msg-0007", thread_id: "pending:1700000000", role: "user", content: "x", created_at: 50 }],
+  });
+  const first = Store.repairThreadIds(state);
+  assert.equal(first.repaired, 2);
+  assert.equal(first.removed, 2);
+  const second = Store.repairThreadIds(first.state);
+  assert.equal(second.repaired, 0);
+  assert.equal(second.removed, 0);
+  assert.deepEqual(json(second.state), json(first.state));
+});
+
+test("repair corrects a sent row whose thread_id disagrees with its key", () => {
+  const result = Store.repairThreadIds(stored({
+    "conv-A": [
+      { id: "msg-0009", thread_id: "conv-Z", role: "user", content: "sent", created_at: 100, synced_at: 200 },
+      { id: "msg-0010", thread_id: "conv-Z", role: "user", content: "unsent", created_at: 101 },
+    ],
+  }));
+  assert.equal(result.repaired, 1);
+  assert.equal(result.removed, 0);
+  const [sent, unsent] = result.state.messages["conv-A"];
+  assert.equal(sent.thread_id, "conv-A");
+  assert.equal(sent.repair, "thread_id");
+  assert.equal(sent.synced_at, undefined);
+  assert.equal(unsent.thread_id, "conv-A");
+  assert.equal("repair" in unsent, false);
+});
+
+test("repair drops pending duplicates and still never sends pending rows", () => {
+  const result = Store.repairThreadIds(stored({
+    "pending:1700000001": [
+      { id: "msg-0011", thread_id: "pending:1700000001", role: "user", content: "dup", created_at: 50 },
+      { id: "msg-0012", thread_id: "pending:1700000001", role: "user", content: "only here", created_at: 51 },
+    ],
+    "conv-A": [{ id: "msg-0011", thread_id: "conv-A", role: "user", content: "dup", created_at: 100, synced_at: 200 }],
+  }));
+  assert.equal(result.removed, 1);
+  assert.equal(result.repaired, 0);
+  assert.deepEqual(ids(result.state.messages["pending:1700000001"]), ["msg-0012"]);
+  assert.equal(result.state.messages["conv-A"][0].synced_at, 200);
+  const scan = Store.syncScan(result.state, HISTORY_ALL);
+  assert.equal(scan.records.length, 0);
+  assert.equal(scan.held.pending, 1);
+  // Copies only under pending keys are not touched by the repair.
+  const pendingOnly = stored({
+    "pending:1": [{ id: "msg-0013", thread_id: "pending:1", role: "user", content: "p", created_at: 1 }],
+    "pending:2": [{ id: "msg-0013", thread_id: "pending:2", role: "user", content: "p", created_at: 2 }],
+  });
+  assert.equal(Store.repairThreadIds(pendingOnly).removed, 0);
+});
+
+test("markSynced clears the repair flag", () => {
+  let state = Store.repairThreadIds(stored({
+    "conv-A": [{ id: "msg-0014", thread_id: "conv-A", role: "user", content: "x", created_at: 100, synced_at: 200 }],
+    "conv-B": [{ id: "msg-0014", thread_id: "conv-B", role: "user", content: "x", created_at: 300, synced_at: 400 }],
+  })).state;
+  const batch = Store.syncScan(state, REPAIR_ONLY).records;
+  assert.equal(batch.length, 1);
+  state = Store.markSynced(state, batch, 1700000500);
+  const row = state.messages["conv-A"][0];
+  assert.equal(row.synced_at, 1700000500);
+  assert.equal("repair" in row, false);
+  assert.equal(Store.syncScan(state, REPAIR_ONLY).records.length, 0);
+});
+
+test("Send history includes corrections; the repair-only scan skips everything else", () => {
+  const state = Store.repairThreadIds(stored({
+    "conv-A": [
+      { id: "msg-0015", thread_id: "conv-A", role: "user", content: "x", created_at: 100, synced_at: 200 },
+      { id: "msg-0016", thread_id: "conv-A", role: "user", content: "new", created_at: 101 },
+    ],
+    "conv-B": [{ id: "msg-0015", thread_id: "conv-B", role: "user", content: "x", created_at: 300, synced_at: 400 }],
+  })).state;
+  assert.deepEqual(ids(Store.syncScan(state, HISTORY_ALL).records), ["msg-0015", "msg-0016"]);
+  // Default (no repair option) holds the correction.
+  const plainHistory = Store.syncScan(state, HISTORY);
+  assert.deepEqual(ids(plainHistory.records), ["msg-0016"]);
+  assert.equal(plainHistory.held.repair, 1);
+  assert.deepEqual(ids(Store.syncScan(state, REPAIR_ONLY).records), ["msg-0015"]);
+});
+
+test("repair flag never reaches the wire or the export", () => {
+  const state = Store.repairThreadIds(stored(
+    {
+      "conv-A": [{ id: "msg-0017", thread_id: "conv-A", role: "user", content: "x", created_at: 100, synced_at: 200 }],
+      "conv-B": [{ id: "msg-0017", thread_id: "conv-B", role: "user", content: "x", created_at: 300, synced_at: 400 }],
+    },
+    { "conv-A": { id: "conv-A", title: "New chat", messageCount: 1 } }
+  )).state;
+  const record = Store.syncScan(state, REPAIR_ONLY).records[0];
+  assert.deepEqual(list(Object.keys(record)), ["id", "thread_id", "role", "content", "created_at"]);
+  Store.toJsonl(state)
+    .split("\n")
+    .forEach((line) => {
+      const row = JSON.parse(line);
+      assert.equal("repair" in row, false);
+      assert.equal("synced_at" in row, false);
+      assert.equal("id_source" in row, false);
+    });
+});
+
+test("the ingest idempotency key moves when only thread_id changes", () => {
+  const sent = [{ id: "msg-0018", thread_id: "conv-A", role: "user", content: "sample", created_at: 1700000000 }];
+  const corrected = [{ ...sent[0], thread_id: "conv-B" }];
+  assert.notEqual(ToposIngest.idempotencyKey(sent), ToposIngest.idempotencyKey(corrected));
+  assert.equal(ToposIngest.idempotencyKey(sent), ToposIngest.idempotencyKey(sent.map((row) => ({ ...row }))));
+});
+
+test("content script remap ids match the ids the store filed the page under", () => {
+  const pendingId = "pending:1700000020";
+  const page = [
+    { id: "msg-0019", role: "user", content: "sample question", index: 0 },
+    { id: "", role: "assistant", content: "sample answer", index: 1 },
+  ];
+  let state = Store.upsert(Store.emptyState(), { id: pendingId }, page);
+  const onPage = page.map((row) => Extract.toV1Record(pendingId, row, 0).id).filter(Boolean);
+  state = Store.remapThread(state, pendingId, "conv-0120", { ids: onPage });
+  assert.equal(state.messages[pendingId], undefined);
+  assert.equal(state.messages["conv-0120"].length, 2);
+});

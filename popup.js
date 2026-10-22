@@ -15,6 +15,7 @@ const toposDetail = document.getElementById("toposDetail");
 const toposConnect = document.getElementById("toposConnect");
 const toposDisconnect = document.getElementById("toposDisconnect");
 const toposSendHistory = document.getElementById("toposSendHistory");
+const toposFixLinks = document.getElementById("toposFixLinks");
 const toposProgress = document.getElementById("toposProgress");
 const toposReceipt = document.getElementById("toposReceipt");
 
@@ -112,6 +113,28 @@ toposSendHistory.addEventListener("click", () => {
   });
 });
 
+toposFixLinks.addEventListener("click", () => {
+  const repairQueued = (topos && topos.repairQueued) || 0;
+  if (!repairQueued) {
+    toposReceipt.hidden = false;
+    toposReceipt.classList.remove("err");
+    toposReceipt.textContent = "No chat links need fixing.";
+    return;
+  }
+  // Same no-confirm pattern as Send history: the count in the label is the
+  // confirmation, and a modal would close the popup before the send is queued.
+  toposFixLinks.disabled = true;
+  toposProgress.hidden = false;
+  toposProgress.classList.remove("err");
+  toposProgress.textContent = `Sending 0 of ${repairQueued}…`;
+  chrome.runtime.sendMessage({ type: "topos.submitRepair" }, (receipt) => {
+    void chrome.runtime.lastError;
+    toposFixLinks.disabled = false;
+    if (receipt) showReceipt(receipt);
+    refreshTopos();
+  });
+});
+
 chrome.runtime.onMessage.addListener((message) => {
   if (!message || typeof message.type !== "string") return undefined;
   if (message.type === "topos.progress") {
@@ -189,6 +212,10 @@ function renderTopos() {
   toposSendHistory.hidden = !connected;
   toposSendHistory.disabled = !topos.queued || Boolean(topos.syncing);
   toposSendHistory.textContent = topos.queued ? `Send history (${topos.queued})` : "Send history";
+  const repairQueued = topos.repairQueued || 0;
+  toposFixLinks.hidden = !connected || !repairQueued;
+  toposFixLinks.disabled = !repairQueued || Boolean(topos.syncing);
+  toposFixLinks.textContent = repairQueued ? `Fix chat links (${repairQueued})` : "Fix chat links";
 
   if (topos.expired) {
     toposState.textContent = "Reconnect";
@@ -219,8 +246,14 @@ function renderTopos() {
     const backlog = topos.queued
       ? `${topos.queued} stored message${topos.queued === 1 ? "" : "s"} can still be sent with Send history.`
       : "Nothing is waiting to be sent.";
+    const repairQueued = topos.repairQueued || 0;
+    const repairLine = repairQueued
+      ? ` ${repairQueued} message${repairQueued === 1 ? " was" : "s were"} filed under the wrong chat and will be corrected when you press Fix chat links.`
+      : "";
     toposDetail.textContent =
-      `New messages sync automatically. ${backlog}` + (waiting.length ? ` Holding ${waiting.join(" and ")}.` : "");
+      `New messages sync automatically. ${backlog}` +
+      (waiting.length ? ` Holding ${waiting.join(" and ")}.` : "") +
+      repairLine;
   }
 
   if (topos.lastError && !connected) {

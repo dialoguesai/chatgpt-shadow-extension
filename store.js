@@ -3,6 +3,9 @@ const ChatGPTShadowStore = (() => {
     enabled: "cs_enabled",
     index: "cs_index",
     messages: "cs_messages",
+    // Copies the one-time repair took out of the store. Local only: never read by
+    // syncScan, toWireRecord or the export; cleared by Clear.
+    archive: "cs_repair_archive",
   };
 
   /** A thread id we invented because the URL had none yet. Never leaves the machine. */
@@ -10,6 +13,21 @@ const ChatGPTShadowStore = (() => {
 
   /** A message id we derived from a content hash because the DOM carried none. */
   const DERIVED_ID_PREFIX = "shadow:";
+
+  /** The pending: key ChatGPT's local-chatgpt:<uuid> placeholder is held under. */
+  const LOCAL_PENDING_PREFIX = `${PENDING_THREAD_PREFIX}local-chatgpt:`;
+
+  /**
+   * True when a copy parked under this pending: key may move into the real thread
+   * being captured: an anonymous placeholder, or a local-chatgpt: placeholder whose
+   * id the page's messages still carry. The same test the content script applies
+   * before it asks for a remap.
+   */
+  function pendingIsSameChat(key, localIds) {
+    if (!String(key).startsWith(LOCAL_PENDING_PREFIX)) return true;
+    const local = String(key).slice(PENDING_THREAD_PREFIX.length);
+    return Array.isArray(localIds) && localIds.includes(local);
+  }
 
   /** Hard cap on records per outbound request. */
   const MAX_BATCH = 200;
@@ -89,6 +107,7 @@ const ChatGPTShadowStore = (() => {
     const byId = new Map(existing.map((row) => [row.id, row]));
     const now = Math.floor(Date.now() / 1000);
     const threadIsPending = isPendingThreadId(threadId);
+    const localIds = Array.isArray(conversation.localIds) ? conversation.localIds : [];
     // Built once, from the store as it stood before this capture.
     const home = homeOf(next.messages);
     // pending: key -> ids that resolved under this real thread and leave it.
@@ -99,6 +118,12 @@ const ChatGPTShadowStore = (() => {
       // "dom" means the id is ChatGPT's own message id. "derived" means stableMessageId
       // fell back to a content hash, so the id changes when the text changes.
       const idSource = message.id ? "dom" : "derived";
+      if (idSource === "derived" && !byId.has(record.id)) {
+        // A row derived before 0.2.3 hashed the raw text. Keep its id, so the
+        // node's record for it is updated rather than written a second time.
+        const legacy = ChatGPTShadowExtract.legacyMessageId(threadId, message);
+        if (legacy && byId.has(legacy)) record.id = legacy;
+      }
       let prev = byId.get(record.id);
       if (!prev) {
         const realHome = home.real.get(record.id);
@@ -108,9 +133,15 @@ const ChatGPTShadowStore = (() => {
         if (realHome && realHome !== threadId) return;
       }
       if (!threadIsPending && home.pending.has(record.id)) {
+        const parkedKeys = Array.from(home.pending.get(record.id));
+        // A copy parked under a local-chatgpt: placeholder this page cannot be tied
+        // to belongs to that chat: the URL may name another chat while the page
+        // still shows it. It stays parked, and is not filed here either.
+        if (!prev && parkedKeys.some((key) => !pendingIsSameChat(key, localIds))) return;
         // The id now resolves under a real thread: take the parked copy along
         // (keeping its fields) and leave no copy behind under the placeholder.
-        home.pending.get(record.id).forEach((key) => {
+        parkedKeys.forEach((key) => {
+          if (!pendingIsSameChat(key, localIds)) return;
           if (!prev) {
             const parked = (next.messages[key] || []).find((row) => row && row.id === record.id);
             if (parked) prev = parked;
@@ -209,6 +240,10 @@ const ChatGPTShadowStore = (() => {
     const fromMeta = next.index[fromId] || {};
     const toMeta = next.index[toId] || {};
     settleThread(next, fromId, stay);
+    // Rows left behind belong to no chat the tab still tracks: the content script
+    // forgets fromId after the remap. They stay here, are never sent, and the
+    // popup says so instead of counting them as waiting for an id.
+    if (stay.length && next.index[fromId]) next.index[fromId] = { ...next.index[fromId], unassigned: true };
     if (!merged.length && !next.index[toId]) return next;
     next.messages[toId] = merged;
     next.index[toId] = {
@@ -224,19 +259,48 @@ const ChatGPTShadowStore = (() => {
     return next;
   }
 
+  /** The thread id a row went to the node under: its own real thread_id, else its key. */
+  function wireThread(key, row) {
+    const own = row && row.thread_id;
+    return own && !isPendingThreadId(own) ? own : key;
+  }
+
   /**
    * One-time correction for stores written before one-thread-per-id held.
    *
+   * What the node holds decides what may be resent. The node keys a ChatGPT
+   * message on its id: the conversation it files the row under is set by the
+   * first send and never changes, while metadata_json.thread_id follows the latest
+   * send. A copy's synced_at is its latest send, so the earliest send of all is
+   * known only when it is the home copy's.
+   *
    * For an id stored under more than one thread with at least one real thread,
    * the home is the real copy captured first (created_at asc, then synced_at asc
-   * with unsynced last, then key asc). Every other copy is removed. When a
-   * wrong-thread copy reached the node no earlier than the home copy, the node now
-   * holds that copy's thread_id, so the home row is marked `repair` and loses its
-   * synced marker; its content becomes the content the node holds, so the resend
-   * changes only the thread_id. A row whose real thread_id disagrees with its key
-   * takes the key, and is marked for resend if it was already sent.
+   * with unsynced last, then key asc). Every other copy leaves the store for the
+   * archive (`archive`, kept on this machine, never sent). Then, over the real
+   * copies that were sent (synced_at asc; on a tie the home first, as one batch
+   * sends in created_at order):
    *
-   * Pure and idempotent: no clock, and a second run changes nothing.
+   * - none sent, or only the home: nothing to correct on the node.
+   * - the home went first under its own key and a wrong copy went last: the node
+   *   files the row under the home chat with a wrong thread_id. The home row is
+   *   marked `repair`, loses its synced marker, and carries `repair_content`, the
+   *   text the node holds, so the resend changes only the thread_id. The row's own
+   *   text is the most recently updated copy's (ties keep the home's).
+   * - otherwise (the home was never sent, or a wrong copy may have been the first
+   *   send): the node files the row under a chat the extension cannot change, and a
+   *   resend under the home would split the row. The home row mirrors the node
+   *   instead: the latest send's synced_at, text and thread_id, plus `node_thread`,
+   *   the chat the node files it under. Not marked, not resent; nodeSideCounts
+   *   reports it.
+   *
+   * A surviving row whose real thread_id disagrees with its key takes the key when
+   * it was never sent. When it was sent, the node files it under that thread_id,
+   * so it is left as is and gets `node_thread`.
+   *
+   * Any row whose text the repair replaces is archived first, as are removed
+   * copies, so nothing local is lost. Pure and idempotent: no clock, and a second
+   * run changes nothing.
    */
   function repairThreadIds(state) {
     const source = state.messages || {};
@@ -253,18 +317,32 @@ const ChatGPTShadowStore = (() => {
 
     const drop = new Map(); // key -> Set of positions to remove
     const replace = new Map(); // key -> Map position -> row
+    const archive = {};
     let repaired = 0;
     let removed = 0;
-    const markDrop = (loc) => {
+    let nodeSide = 0;
+    const toArchive = (key, row, reason, homeKey) => {
+      if (!archive[key]) archive[key] = { meta: state.index && state.index[key] ? { ...state.index[key] } : null, rows: [] };
+      archive[key].rows.push({ ...row, archived: reason, home: homeKey });
+    };
+    const markDrop = (loc, homeKey) => {
       if (!drop.has(loc.key)) drop.set(loc.key, new Set());
       drop.get(loc.key).add(loc.position);
+      toArchive(loc.key, loc.row, "copy", homeKey);
       removed += 1;
     };
     const markReplace = (loc, row) => {
       if (!replace.has(loc.key)) replace.set(loc.key, new Map());
       replace.get(loc.key).set(loc.position, row);
+      if (row.content !== loc.row.content) toArchive(loc.key, loc.row, "replaced", loc.key);
     };
     const syncedOrLast = (row) => (row.synced_at ? Number(row.synced_at) : Infinity);
+    const byCapture = (a, b) => {
+      const created = Number(a.row.created_at || 0) - Number(b.row.created_at || 0);
+      if (created) return created;
+      if (a.key !== b.key) return a.key < b.key ? -1 : 1;
+      return a.position - b.position;
+    };
 
     locations.forEach((locs) => {
       const reals = locs.filter((loc) => !isPendingThreadId(loc.key));
@@ -277,22 +355,60 @@ const ChatGPTShadowStore = (() => {
         if (a.key !== b.key) return a.key < b.key ? -1 : 1;
         return a.position - b.position;
       })[0];
-      const others = locs.filter((loc) => loc !== homeLoc);
-      const sentElsewhere = others.filter((loc) => !isPendingThreadId(loc.key) && loc.row.synced_at);
-      const homeSynced = homeLoc.row.synced_at;
-      const wrongOnNode = sentElsewhere.some(
-        (loc) => !homeSynced || Number(loc.row.synced_at) >= Number(homeSynced)
-      );
-      others.forEach(markDrop);
-      if (wrongOnNode) {
-        const latest = sentElsewhere
-          .slice()
-          .sort((a, b) => Number(b.row.synced_at) - Number(a.row.synced_at))[0];
-        const fixed = { ...homeLoc.row, thread_id: homeLoc.key, content: latest.row.content, repair: "thread_id" };
+      const homeKey = homeLoc.key;
+      locs.filter((loc) => loc !== homeLoc).forEach((loc) => markDrop(loc, homeKey));
+
+      const sent = reals
+        .filter((loc) => loc.row.synced_at)
+        .sort((a, b) => {
+          const synced = Number(a.row.synced_at) - Number(b.row.synced_at);
+          if (synced) return synced;
+          if (a === homeLoc) return -1;
+          if (b === homeLoc) return 1;
+          return byCapture(a, b);
+        });
+      if (!sent.some((loc) => loc !== homeLoc)) return;
+      const earliest = sent[0];
+      const latest = sent[sent.length - 1];
+      const nodeThread = wireThread(earliest.key, earliest.row);
+      const nodeLatest = wireThread(latest.key, latest.row);
+
+      if (earliest === homeLoc && nodeThread === homeKey) {
+        // The node files the row under the home chat; only its thread_id is wrong.
+        if (nodeLatest === homeKey) return;
+        const newest = reals.slice().sort((a, b) => {
+          const updated = Number(b.row.updated_at || 0) - Number(a.row.updated_at || 0);
+          if (updated) return updated;
+          if (a === homeLoc) return -1;
+          if (b === homeLoc) return 1;
+          return byCapture(a, b);
+        })[0];
+        const fixed = {
+          ...homeLoc.row,
+          thread_id: homeKey,
+          content: newest.row.content,
+          repair: "thread_id",
+          repair_content: latest.row.content,
+        };
         delete fixed.synced_at;
+        delete fixed.node_thread;
         markReplace(homeLoc, fixed);
         repaired += 1;
+        return;
       }
+
+      // The node's chat for this row is not provably the home: mirror the node.
+      const mirrored = {
+        ...homeLoc.row,
+        content: latest.row.content,
+        synced_at: latest.row.synced_at,
+        thread_id: nodeLatest,
+        node_thread: nodeThread,
+      };
+      delete mirrored.repair;
+      delete mirrored.repair_content;
+      markReplace(homeLoc, mirrored);
+      nodeSide += 1;
     });
 
     // A surviving row whose real thread_id disagrees with the thread holding it.
@@ -304,18 +420,19 @@ const ChatGPTShadowStore = (() => {
         if (drop.has(key) && drop.get(key).has(position)) return;
         const current = (replace.has(key) && replace.get(key).get(position)) || row;
         if (!current.thread_id || isPendingThreadId(current.thread_id) || current.thread_id === key) return;
-        const fixed = { ...current, thread_id: key };
+        if (current.node_thread) return;
         if (current.synced_at) {
-          delete fixed.synced_at;
-          fixed.repair = "thread_id";
-          if (!current.repair) repaired += 1;
+          // Sent under its own thread_id, so that is where the node files it.
+          markReplace({ key, position, row }, { ...current, node_thread: current.thread_id });
+          nodeSide += 1;
+          return;
         }
-        markReplace({ key, position }, fixed);
+        markReplace({ key, position, row }, { ...current, thread_id: key });
       });
     });
 
     if (!drop.size && !replace.size) {
-      return { state, repaired: 0, removed: 0 };
+      return { state, repaired: 0, removed: 0, nodeSide: 0, archive: {} };
     }
 
     const next = {
@@ -331,7 +448,51 @@ const ChatGPTShadowStore = (() => {
         .filter(Boolean);
       settleThread(next, key, rows);
     });
-    return { state: next, repaired, removed };
+    return { state: next, repaired, removed, nodeSide, archive };
+  }
+
+  /**
+   * Fold one repair run's archive into the stored archive. A row already held for
+   * the same key with the same id, text and reason is not added twice, so a run
+   * interrupted between the two writes cannot duplicate it.
+   */
+  function mergeArchive(existing, additions) {
+    const merged = isPlain(existing) ? { ...existing } : {};
+    Object.keys(additions || {}).forEach((key) => {
+      const add = additions[key];
+      const have = isPlain(merged[key]) ? merged[key] : { meta: null, rows: [] };
+      const rows = Array.isArray(have.rows) ? have.rows.slice() : [];
+      const seen = new Set(rows.map((row) => `${row.id}\u0000${row.archived}\u0000${row.content}`));
+      (add.rows || []).forEach((row) => {
+        const mark = `${row.id}\u0000${row.archived}\u0000${row.content}`;
+        if (seen.has(mark)) return;
+        seen.add(mark);
+        rows.push(row);
+      });
+      merged[key] = { meta: have.meta || add.meta || null, rows };
+    });
+    return merged;
+  }
+
+  /**
+   * Rows the repair found filed on the node under a chat it cannot correct, as
+   * counts only. `mismatch` is the part whose latest send named another chat than
+   * the one the node files the row under: those rows are in the node's own count
+   * of rows whose thread_id disagrees with their conversation.
+   */
+  function nodeSideCounts(state) {
+    let total = 0;
+    let mismatch = 0;
+    Object.keys(state.messages || {}).forEach((key) => {
+      const rows = state.messages[key];
+      if (!Array.isArray(rows)) return;
+      rows.forEach((row) => {
+        if (!row || !row.node_thread) return;
+        total += 1;
+        if (row.node_thread !== wireThread(key, row)) mismatch += 1;
+      });
+    });
+    return { total, mismatch };
   }
 
   function listConversations(state) {
@@ -416,12 +577,14 @@ const ChatGPTShadowStore = (() => {
     const repair = opts.repair === "include" || opts.repair === "only" ? opts.repair : "hold";
 
     const records = [];
-    const held = { pending: 0, streaming: 0, derived: 0, beforeBaseline: 0, repair: 0 };
+    const held = { pending: 0, unassigned: 0, streaming: 0, derived: 0, beforeBaseline: 0, repair: 0 };
     let synced = 0;
 
     Object.keys(state.messages || {}).forEach((threadId) => {
       const rows = Array.isArray(state.messages[threadId]) ? state.messages[threadId] : [];
       const streaming = skipStreaming && isThreadStreaming(state, threadId);
+      const meta = (state.index || {})[threadId];
+      const unassigned = Boolean(meta && meta.unassigned);
       rows.forEach((row) => {
         if (!row || !row.id) return;
         if (row.synced_at) {
@@ -432,7 +595,9 @@ const ChatGPTShadowStore = (() => {
         // strand records under an id that never becomes real, so hold the row
         // until remapThread merges it into the conversation id from the URL.
         if (isPendingThreadId(threadId) || isPendingThreadId(row.thread_id)) {
-          held.pending += 1;
+          // Left behind by a remap: no tab tracks the placeholder any more.
+          if (unassigned && isPendingThreadId(threadId)) held.unassigned += 1;
+          else held.pending += 1;
           return;
         }
         // A thread-id correction rewrites a row the node already holds, so it goes
@@ -459,7 +624,11 @@ const ChatGPTShadowStore = (() => {
           held.beforeBaseline += 1;
           return;
         }
-        records.push(toWireRecord(row, threadId, conversationTitle(state, threadId)));
+        const record = toWireRecord(row, threadId, conversationTitle(state, threadId));
+        // A correction carries the text the node already holds, so it changes only
+        // the thread_id; newer local text follows once the correction lands.
+        if (row.repair && typeof row.repair_content === "string") record.content = row.repair_content;
+        records.push(record);
       });
     });
 
@@ -488,6 +657,9 @@ const ChatGPTShadowStore = (() => {
   /**
    * Rule 4: stamp synced_at so a row is never sent twice. A row whose text moved
    * on since the send is left alone, so the newer text goes out on the next run.
+   * A correction that lands loses its repair marker; when the row's own text
+   * differs from the text the correction carried, the row stays unsynced so that
+   * text goes out next as an ordinary send.
    */
   function markSynced(state, records, syncedAt) {
     const stamp = Number.isFinite(syncedAt) ? syncedAt : Math.floor(Date.now() / 1000);
@@ -510,10 +682,15 @@ const ChatGPTShadowStore = (() => {
         if (!row || !row.id) return row;
         const key = `${row.thread_id || threadId}\u0000${row.id}`;
         if (!wanted.has(key)) return row;
-        if (wanted.get(key) !== row.content) return row;
+        const carried = row.repair && typeof row.repair_content === "string" ? row.repair_content : row.content;
+        if (wanted.get(key) !== carried) return row;
         changed = true;
-        const stamped = { ...row, synced_at: stamp };
+        const stamped = { ...row };
         delete stamped.repair;
+        delete stamped.repair_content;
+        if (carried === row.content || normalizeForCompare(carried) === normalizeForCompare(row.content)) {
+          stamped.synced_at = stamp;
+        }
         return stamped;
       });
       if (changed) next.messages[threadId] = updated;
@@ -538,9 +715,12 @@ const ChatGPTShadowStore = (() => {
     normalizeState,
     normalizeForCompare,
     homeOf,
+    pendingIsSameChat,
     upsert,
     remapThread,
     repairThreadIds,
+    mergeArchive,
+    nodeSideCounts,
     listConversations,
     messageCount,
     toWireRecord,

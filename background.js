@@ -26,23 +26,37 @@ chrome.runtime.onStartup.addListener(() => {
 });
 
 /**
- * Remove copies of a message filed under a second chat, and mark the rows whose
- * correction the node still needs. Idempotent, so it runs on every install and
- * startup. Nothing is sent from here: corrections wait for Fix chat links.
- * The receipt holds counts only.
+ * Move copies of a message filed under a second chat into the local archive, and
+ * mark the rows whose correction the node still needs. Idempotent, so it runs on
+ * every install and startup. Nothing is sent from here: corrections wait for Fix
+ * chat links. The archive is written before the store, so an interrupted run
+ * never loses a copy. The receipt holds counts only.
  */
 function repairStore() {
-  let summary = { repaired: 0, removed: 0 };
-  return applyChange((state) => {
-    const result = ChatGPTShadowStore.repairThreadIds(state);
-    summary = { repaired: result.repaired, removed: result.removed };
-    return result.state;
-  })
-    .then(() => {
-      if (!summary.repaired && !summary.removed) return undefined;
-      return chrome.storage.local.set({ [REPAIR_RECEIPT_KEY]: { ...summary, at: Date.now() } });
-    })
-    .catch(() => {});
+  writeQueue = writeQueue
+    .catch(() => {})
+    .then(async () => {
+      const state = await readState();
+      const result = ChatGPTShadowStore.repairThreadIds(state);
+      if (result.state === state) return;
+      const archiveKey = ChatGPTShadowStore.KEYS.archive;
+      const stored = await chrome.storage.local.get({ [archiveKey]: {} });
+      await chrome.storage.local.set({
+        [archiveKey]: ChatGPTShadowStore.mergeArchive(stored[archiveKey], result.archive),
+      });
+      await chrome.storage.local.set(ChatGPTShadowStore.serialize(result.state));
+      const nodeSide = ChatGPTShadowStore.nodeSideCounts(result.state);
+      await chrome.storage.local.set({
+        [REPAIR_RECEIPT_KEY]: {
+          repaired: result.repaired,
+          removed: result.removed,
+          nodeSide: nodeSide.total,
+          nodeSideMismatch: nodeSide.mismatch,
+          at: Date.now(),
+        },
+      });
+    });
+  return writeQueue.catch(() => {});
 }
 
 // The content script sets cs_extract_miss while a chat is open but nothing on it
@@ -98,7 +112,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "shadow.clear") {
-    applyChange(() => ChatGPTShadowStore.emptyState()).then(() => sendResponse({ ok: true }));
+    // Clear deletes every local copy, the repair archive included.
+    applyChange(() => ChatGPTShadowStore.emptyState())
+      .then(() => chrome.storage.local.remove([ChatGPTShadowStore.KEYS.archive, REPAIR_RECEIPT_KEY]))
+      .then(() => sendResponse({ ok: true }));
     return true;
   }
 
@@ -242,6 +259,8 @@ async function toposStatus() {
     queued: history.records.length,
     queuedNew: auto.records.length,
     repairQueued: repair.records.length,
+    // Counts only: rows the node files under a chat the extension cannot correct.
+    nodeSide: ChatGPTShadowStore.nodeSideCounts(state),
     held: history.held,
     synced: history.synced,
     receipt: auth.receipt,

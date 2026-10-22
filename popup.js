@@ -243,6 +243,9 @@ function renderTopos() {
     const waiting = [];
     if (held.streaming) waiting.push(`${held.streaming} in a reply still being written`);
     if (held.pending) waiting.push(`${held.pending} in a chat with no id yet`);
+    if (held.unassigned) {
+      waiting.push(`${held.unassigned} that belong${held.unassigned === 1 ? "s" : ""} to no chat and stay here`);
+    }
     const backlog = topos.queued
       ? `${topos.queued} stored message${topos.queued === 1 ? "" : "s"} can still be sent with Send history.`
       : "Nothing is waiting to be sent.";
@@ -250,10 +253,15 @@ function renderTopos() {
     const repairLine = repairQueued
       ? ` ${repairQueued} message${repairQueued === 1 ? " was" : "s were"} filed under the wrong chat and will be corrected when you press Fix chat links.`
       : "";
+    const nodeSide = (topos.nodeSide && topos.nodeSide.total) || 0;
+    const nodeSideLine = nodeSide
+      ? ` ${nodeSide} message${nodeSide === 1 ? " is" : "s are"} filed on your node under a chat this extension cannot correct; nothing is resent for ${nodeSide === 1 ? "it" : "them"}.`
+      : "";
     toposDetail.textContent =
       `New messages sync automatically. ${backlog}` +
       (waiting.length ? ` Holding ${waiting.join(" and ")}.` : "") +
-      repairLine;
+      repairLine +
+      nodeSideLine;
   }
 
   if (topos.lastError && !connected) {
@@ -292,7 +300,10 @@ function render() {
     button.type = "button";
     button.className = "row" + (convo.id === selectedId ? " active" : "");
     button.innerHTML = `<span class="row-title"></span><span class="row-meta"></span>`;
-    button.querySelector(".row-title").textContent = convo.title || "Untitled";
+    // Rows a remap left behind: kept locally, in no chat, never sent.
+    button.querySelector(".row-title").textContent = convo.unassigned
+      ? `${convo.title || "Untitled"} (not in a chat)`
+      : convo.title || "Untitled";
     button.querySelector(".row-meta").textContent = `You ${tally.you} · ChatGPT ${tally.gpt}`;
     button.addEventListener("click", () => {
       selectedId = convo.id;

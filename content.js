@@ -1,6 +1,10 @@
 (() => {
   const DEBOUNCE_MS = 600;
   const NAV_POLL_MS = 800;
+  // ChatGPT moves the URL and swaps the rendered thread in separate steps. A scan
+  // inside this window after the URL changed could file the previous chat's
+  // messages under the new id, and the first chat an id is filed under keeps it.
+  const URL_SETTLE_MS = 1500;
 
   let pendingThreadId = "";
   let lastHref = location.href;
@@ -21,6 +25,9 @@
   // before calling an empty conversation a miss.
   const MISS_GRACE_MS = 4000;
   let pageSeenAt = Date.now();
+  // The URL when the pending scan was scheduled. A scan that finds another URL
+  // was scheduled for a page that is no longer there.
+  let scheduledHref = location.href;
 
   chrome.storage.local.get({ cs_enabled: true }, (stored) => {
     enabled = stored.cs_enabled !== false;
@@ -54,9 +61,10 @@
 
   scheduleScan();
 
-  function scheduleScan() {
+  function scheduleScan(delay) {
     window.clearTimeout(debounceTimer);
-    debounceTimer = window.setTimeout(scan, DEBOUNCE_MS);
+    scheduledHref = location.href;
+    debounceTimer = window.setTimeout(scan, Number.isFinite(delay) ? delay : DEBOUNCE_MS);
   }
 
   function scan() {
@@ -65,12 +73,28 @@
       return;
     }
 
-    const extracted = ChatGPTShadowExtract.extractMessages(document);
+    // The URL moved since the last look (the poll may not have seen it yet).
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      lastFingerprint = "";
+      pageSeenAt = Date.now();
+    }
+    // Wait until the URL has held still for URL_SETTLE_MS, and for a scan that was
+    // scheduled under this URL, before reading the page against it.
+    const settleLeft = URL_SETTLE_MS - (Date.now() - pageSeenAt);
+    if (location.href !== scheduledHref || settleLeft > 0) {
+      scheduleScan(Math.max(settleLeft, DEBOUNCE_MS));
+      return;
+    }
+
+    const found = ChatGPTShadowExtract.extractMessages(document);
+    noteExtractHealth(found.length);
+    // Drop messages the markup files under another saved chat than the URL names.
+    const extracted = ChatGPTShadowExtract.messagesForUrl(found, location.href);
     // The ids these messages were stored under in the placeholder thread: ChatGPT's
     // own id, or the content-hash id the store derived under that placeholder.
-    const idsOnPage = (fromId) =>
-      extracted.map((row) => ChatGPTShadowExtract.toV1Record(fromId, row, 0).id).filter(Boolean);
-    noteExtractHealth(extracted.length);
+    const idsOnPage = (fromId) => ChatGPTShadowExtract.pageRecordIds(fromId, extracted);
+    const localIds = ChatGPTShadowExtract.localConversationIdsOnPage(document);
     paintChip(extracted.length);
     if (!enabled || !extracted.length) return;
 
@@ -85,7 +109,7 @@
       const sameChat =
         !pendingLocal.startsWith("local-chatgpt:") ||
         pendingLocal === lastUrlLocalId ||
-        ChatGPTShadowExtract.localConversationIdsOnPage(document).includes(pendingLocal);
+        localIds.includes(pendingLocal);
       // Only the messages on the page move. An anonymous placeholder can also hold
       // stale rows from a page seen earlier; those stay parked and are never sent.
       if (sameChat) send({ type: "shadow.remap", fromId: pendingThreadId, toId: urlId, ids: idsOnPage(pendingThreadId) });
@@ -124,6 +148,9 @@
         title: ChatGPTShadowExtract.extractTitle(document),
         url: location.href,
         streaming,
+        // Lets the store take a copy parked under a local-chatgpt: placeholder
+        // only when this page is provably that chat.
+        localIds,
       },
       messages: extracted.map((row) => ({
         id: row.id,

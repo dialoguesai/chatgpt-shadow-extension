@@ -112,21 +112,25 @@ Optional. Nothing below happens until you press **Connect**.
 
 Records are sent to `POST /v1/ingestion/app_ingest` in the same shape as the JSONL export. A record is keyed on its message id, so a resend replaces rather than duplicates.
 
-Four kinds of message are never sent automatically:
+Five kinds of message are never sent automatically:
 
 | Held | Why |
 |------|-----|
 | A chat with no conversation id yet | The thread id is a local `pending:` placeholder. Sending it would file records under an id that never becomes real. Released once the URL supplies the real id. |
 | A message with no id in the page | The id had to be derived from a content hash, so it changes when the message is edited and would write twice. It goes only through **Send history**. |
 | A reply still streaming | Sent once the reply settles, so the stored text is the final text. |
-| A correction for a message filed under the wrong chat | Sent only by **Fix chat links** (or **Send history**). It rewrites a row your node already holds, so it never goes on its own. |
+| A correction for a message filed under the wrong chat | Sent only by **Fix chat links** (or **Send history**). It rewrites a row your node already holds, so it never goes on its own. An edit to such a message waits with it: the correction carries the text your node already holds, and the edited text goes out on the next send after it. |
+| A message a chat with no id yet left behind | When a new chat gets its real id, only the messages on the page move into it. Others captured under the same placeholder (from a page seen earlier) stay in the extension, are listed as *not in a chat*, and are never sent. One of them moves into a real chat if it is seen there later. |
 
 Two rules decide what counts as a new or changed message:
 
-- **One message id belongs to one chat, the first one it was captured in.** The same message seen under another URL (a `/share/` copy, a branched chat, or the page still showing the previous chat while the URL has moved on) is ignored, so it is never sent under a second chat. A chat with no id yet only takes the messages on the page when its real id appears.
-- **Whitespace-only recaptures are not edits.** Text is compared with runs of whitespace collapsed, and stored exactly as captured. A recapture that differs only in spacing or line breaks keeps the stored text and is not resent; any other change is.
+- **One message id belongs to one chat, the first one it was captured in.** The same message seen under another URL (a `/share/` copy, a branched chat, or the page still showing the previous chat while the URL has moved on) is ignored, so it is never sent under a second chat. A chat with no id yet only takes the messages on the page when its real id appears, and a message held for one new chat moves into a real chat only when the page still carries that new chat's id. Because the first chat wins, the page is read against the URL only once the URL has held still for 1.5 seconds, and a message whose markup names a different saved chat than the URL is skipped (not on `/share/` pages).
+- **Whitespace-only recaptures are not edits.** Text is compared with runs of whitespace collapsed, and stored exactly as captured. A recapture that differs only in spacing or line breaks keeps the stored text and is not resent; any other change is. This holds for messages without an id in the page too: their derived id is a hash of the collapsed text. Versions before 0.2.3 hashed the raw text; a stored row with such an id keeps it when the same text is captured again.
 
-Versions before 0.2.3 could file a message under a second chat. On install and on browser start the extension removes those copies and, where the wrong chat id is what your node last received, queues one correction per message. The popup then shows **Fix chat links (N)**; pressing it resends those messages with the right chat id and the text your node already holds.
+Versions before 0.2.3 could file a message under a second chat. On install and on browser start the extension takes those copies out of the store and keeps them on this machine in a separate archive (`cs_repair_archive`: never sent, not in the popup or the export, deleted by **Clear**). What happens next depends on what your node holds. The node files a message under the chat of its first send and never moves it; the chat id inside the record follows the latest send.
+
+- The right chat was sent first and a wrong one last: the extension queues one correction for that message. The popup shows **Fix chat links (N)**; pressing it resends those messages with the right chat id and the text your node already holds. If the extension holds newer text for one of them, that text goes out on the next send after the correction.
+- A wrong chat may have been sent first (or the right chat was never sent): resending under the right chat would leave the record disagreeing with where the node files it, so nothing is queued. The extension records which chat the node files it under and stops sending that message under any other chat. The popup counts these messages; correcting them needs a change on the node.
 
 If a send fails because your node is slow or unreachable, the records stay queued in the extension and go out on a later attempt. If the token is rejected, it is deleted, the toolbar badge turns red, and nothing more is sent until you connect again.
 

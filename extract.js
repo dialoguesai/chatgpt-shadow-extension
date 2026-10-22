@@ -13,6 +13,9 @@ const ChatGPTShadowExtract = (() => {
   // A chat ChatGPT has not saved yet lives at /c/local-chatgpt:<uuid> until the
   // server id arrives. The id is a client-side placeholder, never a real thread.
   const LOCAL_THREAD_RE = /\/c\/(local-chatgpt:[a-z0-9-]+)/i;
+  const SHARE_RE = /\/share\//i;
+  // A saved conversation id, the form the /c/<id> URL carries.
+  const SERVER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const SKIP_TAGS = new Set(["button", "svg", "script", "style", "noscript", "nav", "input", "textarea"]);
 
   function decodedHref(href) {
@@ -282,9 +285,37 @@ const ChatGPTShadowExtract = (() => {
         role,
         content,
         index,
+        conversationId: renderedConversationId(el),
       });
     });
     return messages;
+  }
+
+  /**
+   * The conversation id the message was rendered under, when the markup carries
+   * one ("" otherwise). It is read from the message node or a node inside it.
+   */
+  function renderedConversationId(node) {
+    return (
+      attr(node, LOCAL_CONVERSATION_ATTR) ||
+      attr(node && node.querySelector && node.querySelector(`[${LOCAL_CONVERSATION_ATTR}]`), LOCAL_CONVERSATION_ATTR)
+    ).trim();
+  }
+
+  /**
+   * Drop messages the markup files under a different saved conversation than the
+   * URL names: the page is still showing the chat it navigated away from (or has
+   * rendered the next chat before the URL moved). Only positive evidence drops a
+   * message: no attribute, a local-chatgpt: id, or a /share/ page keeps it.
+   */
+  function messagesForUrl(messages, href) {
+    const rows = Array.from(messages || []);
+    const urlId = conversationIdFromUrl(href);
+    if (!urlId || SHARE_RE.test(decodedHref(href))) return rows;
+    return rows.filter((message) => {
+      const rendered = String((message && message.conversationId) || "");
+      return !(SERVER_ID_RE.test(rendered) && rendered.toLowerCase() !== urlId.toLowerCase());
+    });
   }
 
   function unitRole(unit) {
@@ -334,14 +365,46 @@ const ChatGPTShadowExtract = (() => {
       const content = unitText(unit, role);
       const id = unitMessageId(unit);
       if (!content || isPlaceholderMessage(id, content)) return;
-      messages.push({ id, role, content, index });
+      messages.push({ id, role, content, index, conversationId: renderedConversationId(unit) });
     });
     return messages;
   }
 
+  /**
+   * ChatGPT's own message id, or one derived from the content when the DOM has
+   * none. The hash is taken over the text with whitespace runs collapsed (the
+   * store's comparison form), so a whitespace-only recapture keeps its id.
+   * Derived ids written before 0.2.3 hashed the raw text; see legacyMessageId.
+   */
   function stableMessageId(threadId, message) {
     if (message.id) return message.id;
+    return `shadow:${threadId}:${message.role}:${message.index}:${hashText(collapseWhitespace(message.content))}`;
+  }
+
+  /** The derived id as versions before 0.2.3 computed it (raw text hash), or "" for a DOM id. */
+  function legacyMessageId(threadId, message) {
+    if (message.id) return "";
     return `shadow:${threadId}:${message.role}:${message.index}:${hashText(message.content)}`;
+  }
+
+  /**
+   * Every id the store may hold the page's messages under in threadId: ChatGPT's
+   * id, or the derived id in its current and pre-0.2.3 forms. The content script
+   * sends this list with a remap so only the messages on the page move.
+   */
+  function pageRecordIds(threadId, messages) {
+    const ids = [];
+    Array.from(messages || []).forEach((message) => {
+      if (!message) return;
+      [stableMessageId(threadId, message), legacyMessageId(threadId, message)].forEach((id) => {
+        if (id && !ids.includes(id)) ids.push(id);
+      });
+    });
+    return ids;
+  }
+
+  function collapseWhitespace(text) {
+    return String(text ?? "").replace(/\s+/g, " ").trim();
   }
 
   function hashText(value) {
@@ -538,6 +601,10 @@ const ChatGPTShadowExtract = (() => {
     htmlToMarkdown,
     renderMarkdown,
     stableMessageId,
+    legacyMessageId,
+    pageRecordIds,
+    messagesForUrl,
+    collapseWhitespace,
     toV1Record,
   };
 })();

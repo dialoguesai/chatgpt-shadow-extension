@@ -15,12 +15,54 @@ let autoSyncDirty = false;
 /** Set after a failed send so the automatic path does not hammer a slow node. */
 let nextAutoSyncAt = 0;
 
+const REPAIR_RECEIPT_KEY = "cs_repair_receipt";
+
 chrome.runtime.onInstalled.addListener(() => {
-  refreshBadge();
+  repairStore().finally(() => refreshBadge());
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  refreshBadge();
+  repairStore().finally(() => refreshBadge());
+});
+
+/**
+ * Move copies of a message filed under a second chat into the local archive, and
+ * mark the rows whose correction the node still needs. Idempotent, so it runs on
+ * every install and startup. Nothing is sent from here: corrections wait for Fix
+ * chat links. The archive is written before the store, so an interrupted run
+ * never loses a copy. The receipt holds counts only.
+ */
+function repairStore() {
+  writeQueue = writeQueue
+    .catch(() => {})
+    .then(async () => {
+      const state = await readState();
+      const result = ChatGPTShadowStore.repairThreadIds(state);
+      if (result.state === state) return;
+      const archiveKey = ChatGPTShadowStore.KEYS.archive;
+      const stored = await chrome.storage.local.get({ [archiveKey]: {} });
+      await chrome.storage.local.set({
+        [archiveKey]: ChatGPTShadowStore.mergeArchive(stored[archiveKey], result.archive),
+      });
+      await chrome.storage.local.set(ChatGPTShadowStore.serialize(result.state));
+      const nodeSide = ChatGPTShadowStore.nodeSideCounts(result.state);
+      await chrome.storage.local.set({
+        [REPAIR_RECEIPT_KEY]: {
+          repaired: result.repaired,
+          removed: result.removed,
+          nodeSide: nodeSide.total,
+          nodeSideMismatch: nodeSide.mismatch,
+          at: Date.now(),
+        },
+      });
+    });
+  return writeQueue.catch(() => {});
+}
+
+// The content script sets cs_extract_miss while a chat is open but nothing on it
+// reads as a message, so a ChatGPT markup change shows on the badge, not just in-page.
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.cs_extract_miss) refreshBadge();
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -38,7 +80,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "shadow.remap") {
-    applyChange((state) => ChatGPTShadowStore.remapThread(state, message.fromId, message.toId)).then(() => {
+    applyChange((state) =>
+      ChatGPTShadowStore.remapThread(state, message.fromId, message.toId, {
+        ids: Array.isArray(message.ids) ? message.ids : undefined,
+      })
+    ).then(() => {
       sendResponse({ ok: true });
       // The pending: rows just became addressable under the real conversation id.
       scheduleAutoSync();
@@ -66,7 +112,10 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "shadow.clear") {
-    applyChange(() => ChatGPTShadowStore.emptyState()).then(() => sendResponse({ ok: true }));
+    // Clear deletes every local copy, the repair archive included.
+    applyChange(() => ChatGPTShadowStore.emptyState())
+      .then(() => chrome.storage.local.remove([ChatGPTShadowStore.KEYS.archive, REPAIR_RECEIPT_KEY]))
+      .then(() => sendResponse({ ok: true }));
     return true;
   }
 
@@ -101,6 +150,12 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // User-initiated only. Resends just the rows whose thread id was corrected.
+  if (message.type === "topos.submitRepair") {
+    queueSync("repair").then(sendResponse);
+    return true;
+  }
+
   return undefined;
 });
 
@@ -130,6 +185,7 @@ async function refreshBadge(state) {
   const stored = await chrome.storage.local.get({
     [TOPOS_KEYS.expired]: false,
     [TOPOS_KEYS.engineWarning]: false,
+    cs_extract_miss: null,
   });
   if (stored[TOPOS_KEYS.expired]) {
     await chrome.action.setBadgeBackgroundColor({ color: "#c00000" });
@@ -139,6 +195,11 @@ async function refreshBadge(state) {
   if (stored[TOPOS_KEYS.engineWarning]) {
     await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
     await chrome.action.setBadgeText({ text: "!" });
+    return;
+  }
+  if (stored.cs_extract_miss && current.enabled !== false) {
+    await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
+    await chrome.action.setBadgeText({ text: "?" });
     return;
   }
   const count = ChatGPTShadowStore.messageCount(current);
@@ -163,11 +224,22 @@ function broadcast(payload) {
 function autoOptions(auth) {
   // Automatic path: real message ids only, and only what was captured after the
   // account was attached. Anything older is backlog for the history button.
-  return { includeDerived: false, since: auth.baselineAt || 0, skipStreaming: true };
+  // Thread-id corrections rewrite rows the node already holds: never automatic.
+  return { includeDerived: false, since: auth.baselineAt || 0, skipStreaming: true, repair: "hold" };
 }
 
 function historyOptions() {
-  return { includeDerived: true, since: 0, skipStreaming: true };
+  return { includeDerived: true, since: 0, skipStreaming: true, repair: "include" };
+}
+
+function repairOptions() {
+  return { includeDerived: true, since: 0, skipStreaming: true, repair: "only" };
+}
+
+function optionsFor(mode, auth) {
+  if (mode === "history") return historyOptions();
+  if (mode === "repair") return repairOptions();
+  return autoOptions(auth);
 }
 
 async function toposStatus() {
@@ -175,6 +247,7 @@ async function toposStatus() {
   const state = await readState();
   const history = ChatGPTShadowStore.syncScan(state, historyOptions());
   const auto = ChatGPTShadowStore.syncScan(state, autoOptions(auth));
+  const repair = ChatGPTShadowStore.syncScan(state, repairOptions());
   return {
     connected: auth.connected,
     expired: auth.expired,
@@ -185,6 +258,9 @@ async function toposStatus() {
     baselineAt: auth.baselineAt,
     queued: history.records.length,
     queuedNew: auto.records.length,
+    repairQueued: repair.records.length,
+    // Counts only: rows the node files under a chat the extension cannot correct.
+    nodeSide: ChatGPTShadowStore.nodeSideCounts(state),
     held: history.held,
     synced: history.synced,
     receipt: auth.receipt,
@@ -264,6 +340,7 @@ function describeFailure(result) {
 /**
  * mode "auto"    new messages captured since the account was attached
  * mode "history" everything unsynced, user-initiated only
+ * mode "repair"  only the thread-id corrections, user-initiated only
  */
 async function runSync(mode) {
   const auth = await ToposAuth.read();
@@ -278,7 +355,7 @@ async function runSync(mode) {
   }
 
   const state = await readState();
-  const scan = ChatGPTShadowStore.syncScan(state, mode === "history" ? historyOptions() : autoOptions(auth));
+  const scan = ChatGPTShadowStore.syncScan(state, optionsFor(mode, auth));
   const total = scan.records.length;
   if (!total) return { mode, total: 0, landed: 0, queued: 0, failed: 0, held: scan.held };
 

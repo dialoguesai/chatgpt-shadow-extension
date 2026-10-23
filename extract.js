@@ -1,12 +1,55 @@
 const ChatGPTShadowExtract = (() => {
   const ROLE_SELECTOR = "[data-message-author-role]";
+  // The late-September 2026 ChatGPT front end dropped data-message-author-role.
+  // Each user or assistant message is now a "search unit" whose key ends in its
+  // role ("fallback-turn-13:2:assistant"), wrapping a div that carries the
+  // message id. Both layouts are read; the old one wins when it is present.
+  const UNIT_SELECTOR = "[data-chatgpt-search-unit-key]";
+  const MESSAGE_ID_ATTR = "data-chatgpt-selection-message-id";
+  const LOCAL_CONVERSATION_ATTR = "data-chatgpt-selection-conversation-id";
   const STOP_BUTTON = '[data-testid="stop-button"]';
-  const THREAD_RE = /\/(?:c|share)\/([a-z0-9-]+)/i;
+  const TURN_STATE_SELECTOR = "[data-talvt-turn-state]";
+  const THREAD_RE = /\/(?:c|share)\/([a-z0-9-]+)(?=[/?#]|$)/i;
+  // A chat ChatGPT has not saved yet lives at /c/local-chatgpt:<uuid> until the
+  // server id arrives. The id is a client-side placeholder, never a real thread.
+  const LOCAL_THREAD_RE = /\/c\/(local-chatgpt:[a-z0-9-]+)/i;
+  const SHARE_RE = /\/share\//i;
+  // A saved conversation id, the form the /c/<id> URL carries.
+  const SERVER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   const SKIP_TAGS = new Set(["button", "svg", "script", "style", "noscript", "nav", "input", "textarea"]);
 
+  function decodedHref(href) {
+    const raw = String(href || "");
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+
   function conversationIdFromUrl(href) {
-    const match = String(href || "").match(THREAD_RE);
+    const match = decodedHref(href).match(THREAD_RE);
     return match ? match[1] : "";
+  }
+
+  /** The local-chatgpt:<uuid> placeholder from the URL, or "" for a saved chat. */
+  function localConversationIdFromUrl(href) {
+    const match = decodedHref(href).match(LOCAL_THREAD_RE);
+    return match ? match[1] : "";
+  }
+
+  /**
+   * Local placeholder ids the rendered messages still carry. A chat started on
+   * this page keeps them after the URL moves to the server id, which is what ties
+   * the placeholder to the real conversation.
+   */
+  function localConversationIdsOnPage(root) {
+    const ids = new Set();
+    root.querySelectorAll(`[${LOCAL_CONVERSATION_ATTR}]`).forEach((node) => {
+      const value = attr(node, LOCAL_CONVERSATION_ATTR);
+      if (value.startsWith("local-chatgpt:")) ids.add(value);
+    });
+    return Array.from(ids);
   }
 
   function conversationTitleFromPageTitle(title) {
@@ -218,11 +261,18 @@ const ChatGPTShadowExtract = (() => {
 
   function isStreaming(root) {
     const doc = root.ownerDocument || root;
-    return Boolean(doc.querySelector(STOP_BUTTON));
+    if (doc.querySelector(STOP_BUTTON)) return true;
+    // Only "complete" has been observed. Match the in-flight names loosely rather
+    // than treating every non-complete value as streaming: a false "streaming"
+    // holds the thread forever, a false "settled" only costs one resend.
+    return Array.from(doc.querySelectorAll(TURN_STATE_SELECTOR)).some((node) =>
+      /stream|progress|pending|generat|running/i.test(attr(node, "data-talvt-turn-state"))
+    );
   }
 
   function extractMessages(root) {
     const nodes = root.querySelectorAll(ROLE_SELECTOR);
+    if (!nodes.length) return extractUnitMessages(root);
     const messages = [];
     nodes.forEach((el, index) => {
       const role = String(el.getAttribute("data-message-author-role") || "").toLowerCase();
@@ -235,14 +285,126 @@ const ChatGPTShadowExtract = (() => {
         role,
         content,
         index,
+        conversationId: renderedConversationId(el),
       });
     });
     return messages;
   }
 
+  /**
+   * The conversation id the message was rendered under, when the markup carries
+   * one ("" otherwise). It is read from the message node or a node inside it.
+   */
+  function renderedConversationId(node) {
+    return (
+      attr(node, LOCAL_CONVERSATION_ATTR) ||
+      attr(node && node.querySelector && node.querySelector(`[${LOCAL_CONVERSATION_ATTR}]`), LOCAL_CONVERSATION_ATTR)
+    ).trim();
+  }
+
+  /**
+   * Drop messages the markup files under a different saved conversation than the
+   * URL names: the page is still showing the chat it navigated away from (or has
+   * rendered the next chat before the URL moved). Only positive evidence drops a
+   * message: no attribute, a local-chatgpt: id, or a /share/ page keeps it.
+   */
+  function messagesForUrl(messages, href) {
+    const rows = Array.from(messages || []);
+    const urlId = conversationIdFromUrl(href);
+    if (!urlId || SHARE_RE.test(decodedHref(href))) return rows;
+    return rows.filter((message) => {
+      const rendered = String((message && message.conversationId) || "");
+      return !(SERVER_ID_RE.test(rendered) && rendered.toLowerCase() !== urlId.toLowerCase());
+    });
+  }
+
+  function unitRole(unit) {
+    const key = attr(unit, "data-chatgpt-search-unit-key");
+    const suffix = key.match(/:(user|assistant)$/i);
+    if (suffix) return suffix[1].toLowerCase();
+    const tagged = attr(unit, "data-conversation-role") ||
+      attr(unit.querySelector && unit.querySelector("[data-conversation-role]"), "data-conversation-role");
+    if (tagged) return tagged.toLowerCase();
+    if (unit.querySelector && unit.querySelector("[data-user-message-bubble]")) return "user";
+    return "";
+  }
+
+  function unitMessageId(unit) {
+    const own = attr(unit, MESSAGE_ID_ATTR) ||
+      attr(unit.querySelector && unit.querySelector(`[${MESSAGE_ID_ATTR}]`), MESSAGE_ID_ATTR);
+    if (own) return own;
+    return attr(unit, "data-chatgpt-search-message-ids").trim().split(/\s+/)[0] || "";
+  }
+
+  function unitText(unit, role) {
+    const roots = unit.querySelectorAll ? Array.from(unit.querySelectorAll("[data-markdown-text-style]")) : [];
+    if (roots.length) {
+      return cleanChrome(roots.map((node) => htmlToMarkdown(node) || textOf(node)).join("\n\n"));
+    }
+    if (role === "user" && unit.querySelector) {
+      const bubble = unit.querySelector("[data-user-message-bubble]");
+      if (bubble) {
+        const body = bubble.querySelector(".whitespace-pre-wrap") || bubble;
+        return cleanChrome(textOf(body));
+      }
+    }
+    return extractMessageText(unit);
+  }
+
+  function isNestedUnit(unit) {
+    const parent = unit.parentElement;
+    return Boolean(parent && typeof parent.closest === "function" && parent.closest(UNIT_SELECTOR));
+  }
+
+  function extractUnitMessages(root) {
+    const messages = [];
+    Array.from(root.querySelectorAll(UNIT_SELECTOR)).forEach((unit, index) => {
+      if (isNestedUnit(unit)) return;
+      const role = unitRole(unit);
+      if (role !== "user" && role !== "assistant") return;
+      const content = unitText(unit, role);
+      const id = unitMessageId(unit);
+      if (!content || isPlaceholderMessage(id, content)) return;
+      messages.push({ id, role, content, index, conversationId: renderedConversationId(unit) });
+    });
+    return messages;
+  }
+
+  /**
+   * ChatGPT's own message id, or one derived from the content when the DOM has
+   * none. The hash is taken over the text with whitespace runs collapsed (the
+   * store's comparison form), so a whitespace-only recapture keeps its id.
+   * Derived ids written before 0.2.3 hashed the raw text; see legacyMessageId.
+   */
   function stableMessageId(threadId, message) {
     if (message.id) return message.id;
+    return `shadow:${threadId}:${message.role}:${message.index}:${hashText(collapseWhitespace(message.content))}`;
+  }
+
+  /** The derived id as versions before 0.2.3 computed it (raw text hash), or "" for a DOM id. */
+  function legacyMessageId(threadId, message) {
+    if (message.id) return "";
     return `shadow:${threadId}:${message.role}:${message.index}:${hashText(message.content)}`;
+  }
+
+  /**
+   * Every id the store may hold the page's messages under in threadId: ChatGPT's
+   * id, or the derived id in its current and pre-0.2.3 forms. The content script
+   * sends this list with a remap so only the messages on the page move.
+   */
+  function pageRecordIds(threadId, messages) {
+    const ids = [];
+    Array.from(messages || []).forEach((message) => {
+      if (!message) return;
+      [stableMessageId(threadId, message), legacyMessageId(threadId, message)].forEach((id) => {
+        if (id && !ids.includes(id)) ids.push(id);
+      });
+    });
+    return ids;
+  }
+
+  function collapseWhitespace(text) {
+    return String(text ?? "").replace(/\s+/g, " ").trim();
   }
 
   function hashText(value) {
@@ -426,7 +588,10 @@ const ChatGPTShadowExtract = (() => {
 
   return {
     ROLE_SELECTOR,
+    UNIT_SELECTOR,
     conversationIdFromUrl,
+    localConversationIdFromUrl,
+    localConversationIdsOnPage,
     conversationTitleFromPageTitle,
     extractTitle,
     extractMessageText,
@@ -436,6 +601,10 @@ const ChatGPTShadowExtract = (() => {
     htmlToMarkdown,
     renderMarkdown,
     stableMessageId,
+    legacyMessageId,
+    pageRecordIds,
+    messagesForUrl,
+    collapseWhitespace,
     toV1Record,
   };
 })();

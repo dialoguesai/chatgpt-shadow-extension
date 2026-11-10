@@ -8,7 +8,7 @@
   <body>
     <header>
       <h1>ChatGPT Shadow</h1>
-      <p class="hint">Local copy of ChatGPT web chats. Nothing is sent anywhere unless you connect a Topos account.</p>
+      <p class="hint">Local copy of ChatGPT web chats. Nothing is sent anywhere unless you connect a Topos.</p>
       <label class="check">
         <input id="enabled" type="checkbox" checked />
         Capture chats
@@ -31,7 +31,8 @@
         <span id="toposState" class="pill">Not connected</span>
       </div>
       <p id="toposDetail" class="fine">
-        Capture stays in this browser. Connect an account to sync new messages to your own Topos.
+        Capture stays in this browser. Connect an account, or a Topos on this computer, to sync new messages to
+        your own Topos.
       </p>
       <div class="actions">
         <button id="toposConnect" type="button">Connect</button>
@@ -42,6 +43,38 @@
       <p id="toposProgress" class="fine" hidden></p>
       <p id="toposReceipt" class="fine" hidden></p>
       <p class="fine">The JSONL export can also be imported into Topos as a file.</p>
+
+      <details id="localTopos" class="local">
+        <summary>Local Topos (no account)</summary>
+        <p id="localNote" class="fine" hidden></p>
+        <div id="localSetup">
+          <p class="fine">
+            A Topos running on this computer can take your chats directly, with no account. In a terminal on this
+            computer, run:
+          </p>
+          <div class="command">
+            <code id="localCommand"></code>
+            <button id="localCopy" type="button" class="ghost">Copy</button>
+          </div>
+          <p class="fine">Topos asks you to say yes, then shows a key once. Paste the key here.</p>
+          <label class="field">
+            <span>Key</span>
+            <input id="localKey" type="password" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="field">
+            <span>Address</span>
+            <input id="localUrl" type="text" autocomplete="off" spellcheck="false" />
+          </label>
+          <div class="actions">
+            <button id="localConnect" type="button">Connect local Topos</button>
+          </div>
+          <p id="localStatus" class="fine" hidden></p>
+        </div>
+        <p class="fine">
+          While a key is saved here, chats go only to the Topos on this computer, even if an account is connected
+          too. Disconnect forgets the key and any account connection; your captured chats stay in this browser.
+        </p>
+      </details>
     </section>
 
     <section class="pane">
@@ -65,6 +98,7 @@
     </section>
 
     <script src="lib/updateCheck.js"></script>
+    <script src="lib/toposConfig.js"></script>
     <script src="extract.js"></script>
     <script src="store.js"></script>
     <script src="popup.js"></script>

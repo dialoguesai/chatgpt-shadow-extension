@@ -12,7 +12,9 @@
     "https://chatgpt.com/*",
     "https://chat.openai.com/*",
     "https://cp.logu3s.com/*",
-    "https://raw.githubusercontent.com/*"
+    "https://raw.githubusercontent.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
   "background": {
     "service_worker": "background.js"

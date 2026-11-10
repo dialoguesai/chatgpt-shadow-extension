@@ -10,7 +10,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // suite can load every file into one sandbox exactly the way importScripts does.
 const sandbox = { console, crypto, btoa, TextEncoder };
 sandbox.globalThis = sandbox;
-["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposIngest.js", "lib/updateCheck.js"].forEach((file) => {
+["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposLocal.js", "lib/toposIngest.js", "lib/updateCheck.js"].forEach((file) => {
   vm.runInNewContext(fs.readFileSync(path.join(root, file), "utf8"), sandbox);
 });
 
@@ -1488,7 +1488,7 @@ function backgroundHarness(initial) {
     },
   };
   box.globalThis = box;
-  ["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposIngest.js", "background.js"].forEach((file) => {
+  ["extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposLocal.js", "lib/toposIngest.js", "background.js"].forEach((file) => {
     vm.runInNewContext(fs.readFileSync(path.join(root, file), "utf8"), box);
   });
   const send = (message) =>
@@ -1498,7 +1498,7 @@ function backgroundHarness(initial) {
     });
   // setEnabled queues behind every earlier store write, so it doubles as a barrier.
   const settle = () => send({ type: "shadow.setEnabled", enabled: true });
-  return { data, listeners, send, settle };
+  return { data, listeners, send, settle, box };
 }
 
 test("background: install and startup run the repair, and the archive is written and kept", async () => {
@@ -1568,4 +1568,616 @@ test("background: a remap message moves only the ids it names", async () => {
   assert.deepEqual(bg.data.cs_messages["conv-D"].map((row) => row.id), ["msg-0310"]);
   assert.deepEqual(bg.data.cs_messages["pending:1"].map((row) => row.id), ["msg-0311"]);
   assert.equal(bg.data.cs_index["pending:1"].unassigned, true);
+});
+
+// ------------------------------------------------ local Topos (no account) ---
+//
+// protects: with a local key stored, records go to the node on this computer and
+// nowhere else, as one batch whose write_id is the same on a retry; the node's
+// answers map to drop the key (401), stop for good (403, bad batch) or retry
+// (409, 5xx, no answer); only a loopback address is ever fetched; and without a
+// local key the account request is what it was before the local option existed.
+
+// An invented key in the shape `topos-node pushers add` prints. Not a real one.
+const LOCAL_KEY = "tpw_chatgpt-shadow-extension." + "0".repeat(40);
+const NODE = "http://127.0.0.1:8676";
+const NODE_BATCH = `${NODE}/sources/chatgpt_ui_conversation/ingest/batch`;
+const ACCOUNT = { cs_topos_token: "account-token", cs_topos_resource_id: "resource-0001" };
+const BATCH = [
+  { id: "msg-0401", thread_id: "conv-0401", role: "user", content: "sample question", created_at: 1700000000 },
+  { id: "msg-0402", thread_id: "conv-0401", role: "assistant", content: "sample answer", created_at: 1700000001 },
+];
+// What the node says, word for word (topos-node 1.5.46, api/local_pushers.py and auth.py).
+const NODE_OK = { status: "ok", source_id: "chatgpt_ui_conversation", records_processed: 2, records_total: 2, errors: [], deduplicated: false };
+const NODE_ME = { status: "ok", app: "chatgpt-shadow-extension", owner: false, sources: ["chatgpt_ui_conversation"], origins: ["chrome-extension://test-extension"] };
+const NODE_KEY_REFUSED = {
+  detail: { error: "pusher_key_refused", message: "This app's key is not one this Topos issued, or the app was disconnected." },
+};
+const NODE_SOURCE_REFUSED = {
+  status: "error",
+  error: "source_not_allowed",
+  message: "Source 'chatgpt_ui_conversation' is not one 'chatgpt-shadow-extension' may write",
+};
+
+/** A fetch that records every call and answers from whatever the test set last. */
+function fakeNetwork() {
+  const net = {
+    calls: [],
+    reply: () => {
+      throw new Error("no network in tests");
+    },
+    answer(status, body) {
+      net.reply = () => new Response(typeof body === "string" ? body : JSON.stringify(body), { status });
+    },
+    offline() {
+      net.reply = () => {
+        throw new TypeError("Failed to fetch");
+      };
+    },
+    fetch: async (url, options) => {
+      net.calls.push({ url, options: JSON.parse(JSON.stringify(options || {})) });
+      return net.reply(url, options);
+    },
+  };
+  return net;
+}
+
+/** The connection modules alone, over an in-memory chrome.storage.local and a recorded fetch. */
+function toposHarness(initial) {
+  const data = JSON.parse(JSON.stringify(initial || {}));
+  const copy = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
+  const net = fakeNetwork();
+  const box = {
+    console,
+    crypto,
+    btoa,
+    TextEncoder,
+    fetch: net.fetch,
+    chrome: {
+      storage: {
+        local: {
+          async get(defaults) {
+            const out = {};
+            Object.keys(defaults).forEach((key) => {
+              out[key] = key in data ? copy(data[key]) : defaults[key];
+            });
+            return out;
+          },
+          async set(values) {
+            Object.assign(data, copy(values));
+          },
+          async remove(keys) {
+            [].concat(keys).forEach((key) => delete data[key]);
+          },
+        },
+      },
+      runtime: { id: "test-extension" },
+    },
+  };
+  box.globalThis = box;
+  ["lib/toposConfig.js", "lib/toposAuth.js", "lib/toposLocal.js", "lib/toposIngest.js"].forEach((file) => {
+    vm.runInNewContext(fs.readFileSync(path.join(root, file), "utf8"), box);
+  });
+  return { data, net, Local: box.ChatGPTShadowToposLocal, Ingest: box.ChatGPTShadowToposIngest };
+}
+
+test("local: only an address on this computer is accepted", () => {
+  const ok = (input) => plain(ToposConfig.localNodeUrl(input));
+  assert.equal(ToposConfig.DEFAULT_LOCAL_URL, NODE);
+  assert.deepEqual(ok(""), { ok: true, url: NODE });
+  assert.deepEqual(ok(undefined), { ok: true, url: NODE });
+  assert.deepEqual(ok(" http://127.0.0.1:9100/ "), { ok: true, url: "http://127.0.0.1:9100" });
+  assert.deepEqual(ok("http://localhost:8676"), { ok: true, url: "http://localhost:8676" });
+  assert.deepEqual(ok("HTTP://LOCALHOST:8676"), { ok: true, url: "http://localhost:8676" });
+  [
+    "http://example.test:8676", // not this computer
+    "http://192.168.1.20:8676",
+    "http://127.0.0.1.example.test:8676", // a look-alike host
+    "http://localhost.example.test:8676",
+    "https://127.0.0.1:8676", // https
+    "http://127.0.0.1:8676/sources", // a path
+    "http://127.0.0.1:8676/?next=http://example.test",
+    "http://127.0.0.1:8676#x",
+    "http://user:secret@127.0.0.1:8676", // credentials in the URL
+    "http://127.0.0.1:8676@example.test",
+    "http://127.0.0.1", // no port
+    "http://127.0.0.1:0",
+    "http://127.0.0.1:99999",
+    "http://[::1]:8676",
+    "127.0.0.1:8676",
+    "file:///etc/hosts",
+  ].forEach((input) => {
+    const result = ToposConfig.localNodeUrl(input);
+    assert.equal(result.ok, false, input);
+    assert.match(result.error, /on this computer/, input);
+    assert.equal("url" in result, false, input);
+  });
+});
+
+test("local: the command to run names this install's own origin, never a pattern", () => {
+  assert.equal(
+    ToposConfig.enrollCommand("abcdefghijklmnopabcdefghijklmnop"),
+    "topos-node pushers add chatgpt-shadow-extension --sources chatgpt_ui_conversation " +
+      "--origin chrome-extension://abcdefghijklmnopabcdefghijklmnop"
+  );
+  const manifest = JSON.parse(fs.readFileSync(path.join(root, "manifest.json"), "utf8"));
+  ["http://127.0.0.1/*", "http://localhost/*"].forEach((host) => {
+    assert.ok(manifest.host_permissions.includes(host), host);
+  });
+});
+
+test("local: a stored local key wins, an account is next, and with neither nothing is sent", async () => {
+  const both = toposHarness({ cs_topos_local_key: LOCAL_KEY, ...ACCOUNT });
+  assert.deepEqual(json(await both.Ingest.target()), { mode: "local", url: NODE });
+  // The chosen target is safe to show: it never carries the key or the token.
+  assert.equal(JSON.stringify(await both.Ingest.target()).includes(LOCAL_KEY), false);
+
+  const moved = toposHarness({ cs_topos_local_key: LOCAL_KEY, cs_topos_local_url: "http://localhost:9100" });
+  assert.deepEqual(json(await moved.Ingest.target()), { mode: "local", url: "http://localhost:9100" });
+  // A stored address that is not loopback is never used.
+  const tampered = toposHarness({ cs_topos_local_key: LOCAL_KEY, cs_topos_local_url: "https://example.test" });
+  assert.deepEqual(json(await tampered.Ingest.target()), { mode: "local", url: NODE });
+
+  const account = toposHarness({ ...ACCOUNT });
+  assert.deepEqual(json(await account.Ingest.target()), { mode: "account", url: "https://cp.logu3s.com" });
+
+  const neither = toposHarness({});
+  assert.deepEqual(json(await neither.Ingest.target()), { mode: "none", url: "" });
+  assert.deepEqual(json(await neither.Ingest.send(BATCH)), { ok: false, reason: "not_connected" });
+  assert.equal(neither.net.calls.length, 0);
+
+  // After the node turned the local key away, an account connected earlier is not
+  // used on its own: the person chose this computer, so they decide what is next.
+  const turnedAway = toposHarness({ cs_topos_expired: "local", ...ACCOUNT });
+  assert.equal((await turnedAway.Ingest.target()).mode, "none");
+  assert.deepEqual(json(await turnedAway.Ingest.send(BATCH)), { ok: false, reason: "not_connected" });
+  assert.equal(turnedAway.net.calls.length, 0);
+});
+
+test("local: one batch goes to the node's loopback door with the key as bearer and a stable write_id", async () => {
+  const t = toposHarness({ cs_topos_local_key: LOCAL_KEY, ...ACCOUNT });
+  t.net.answer(200, { ...NODE_OK, write_id: "chatgpt-shadow-2-a14d1b3a-31498b43" });
+  const result = await t.Ingest.send(BATCH);
+
+  assert.equal(t.net.calls.length, 1, "one request, and none to the account");
+  assert.equal(t.net.calls[0].url, NODE_BATCH);
+  assert.equal(t.net.calls[0].url.includes(LOCAL_KEY), false);
+  assert.deepEqual(t.net.calls[0].options, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${LOCAL_KEY}` },
+    body: JSON.stringify({ records: BATCH, write_id: "chatgpt-shadow-2-a14d1b3a-31498b43" }),
+  });
+  assert.deepEqual(json(result), {
+    ok: true,
+    queued: false,
+    target: "local",
+    status: 200,
+    writeId: "chatgpt-shadow-2-a14d1b3a-31498b43",
+    deduplicated: false,
+    unread: 0,
+  });
+
+  // A retry of the same records carries the same write_id; the node answers
+  // deduplicated and writes nothing, and that is still a success.
+  t.net.answer(200, { ...NODE_OK, write_id: "chatgpt-shadow-2-a14d1b3a-31498b43", deduplicated: true });
+  const retried = await t.Ingest.send(BATCH.map((row) => ({ ...row })));
+  assert.equal(JSON.parse(t.net.calls[1].options.body).write_id, JSON.parse(t.net.calls[0].options.body).write_id);
+  assert.deepEqual([retried.ok, retried.deduplicated, retried.target], [true, true, "local"]);
+
+  // An edited message is a different write.
+  await t.Ingest.send([BATCH[0], { ...BATCH[1], content: "sample answer, revised" }]);
+  assert.equal(JSON.parse(t.net.calls[2].options.body).write_id, "chatgpt-shadow-2-a14d1b3a-ac212195");
+  assert.equal(t.data.cs_topos_local_key, LOCAL_KEY);
+});
+
+test("local: a node that could not read some records still took the batch, and says how many", async () => {
+  const t = toposHarness({ cs_topos_local_key: LOCAL_KEY });
+  t.net.answer(200, { ...NODE_OK, records_processed: 1, errors: [{ index: 1, error: "ingest failed" }] });
+  const result = await t.Ingest.send(BATCH);
+  assert.deepEqual([result.ok, result.unread], [true, 1]);
+});
+
+test("local: each answer from the node maps to drop, stop or retry", async () => {
+  const t = toposHarness({ cs_topos_local_key: LOCAL_KEY, cs_topos_local_url: "http://127.0.0.1:9100" });
+
+  // 401: the key is dead. Reported as auth_expired; the caller drops it (see the background test).
+  t.net.answer(401, NODE_KEY_REFUSED);
+  assert.deepEqual(json(await t.Ingest.send(BATCH)), {
+    ok: false,
+    reason: "auth_expired",
+    target: "local",
+    status: 401,
+    message: NODE_KEY_REFUSED.detail.message,
+  });
+  assert.equal(t.net.calls[0].url, "http://127.0.0.1:9100/sources/chatgpt_ui_conversation/ingest/batch");
+
+  // 403: the owner's allowlist says no. Final.
+  t.net.answer(403, NODE_SOURCE_REFUSED);
+  assert.deepEqual(json(await t.Ingest.send(BATCH)), {
+    ok: false,
+    reason: "refused",
+    final: true,
+    target: "local",
+    status: 403,
+    message: NODE_SOURCE_REFUSED.message,
+  });
+
+  // A batch the node will never take. Final.
+  for (const status of [400, 404, 413, 422]) {
+    t.net.answer(status, { status: "error", error: "all_records_failed", message: "All 2 record(s) failed ingestion" });
+    const rejected = await t.Ingest.send(BATCH);
+    assert.deepEqual(
+      [rejected.ok, rejected.reason, rejected.final, rejected.retryable, rejected.status, rejected.target],
+      [false, "rejected", true, undefined, status, "local"],
+      String(status)
+    );
+    assert.equal(rejected.message, "All 2 record(s) failed ingestion");
+  }
+
+  // The node is busy, restarting or has no identity yet. Retry later.
+  for (const status of [409, 500, 502, 503, 504]) {
+    t.net.answer(status, "busy");
+    const later = await t.Ingest.send(BATCH);
+    assert.deepEqual(
+      [later.ok, later.reason, later.retryable, later.final, later.status, later.target],
+      [false, "unavailable", true, undefined, status, "local"],
+      String(status)
+    );
+  }
+
+  // Nothing answered at all. Retry later.
+  t.net.offline();
+  const down = await t.Ingest.send(BATCH);
+  assert.deepEqual([down.ok, down.reason, down.retryable, down.target], [false, "network_error", true, "local"]);
+
+  // This module only reports: the key is still stored, and no result repeats it.
+  assert.equal(t.data.cs_topos_local_key, LOCAL_KEY);
+  // A node that echoed the key back would not get it into a message either.
+  t.net.answer(403, { status: "error", message: `no: Bearer ${LOCAL_KEY}` });
+  const echoed = await t.Ingest.send(BATCH);
+  assert.equal(JSON.stringify(echoed).includes(LOCAL_KEY), false);
+  assert.equal(echoed.message, "no: Bearer [key]");
+});
+
+test("local: a pasted key is stored only when the node accepts it for ChatGPT chats", async () => {
+  const t = toposHarness({});
+  t.net.answer(200, NODE_ME);
+  const connected = await t.Local.connect({ key: `  ${LOCAL_KEY}\n`, url: "http://localhost:8676/" });
+  assert.equal(t.net.calls.length, 1);
+  assert.equal(t.net.calls[0].url, "http://localhost:8676/local-pushers/me");
+  assert.deepEqual(t.net.calls[0].options, { method: "GET", headers: { Authorization: `Bearer ${LOCAL_KEY}` } });
+  assert.equal(connected.connected, true);
+  assert.equal(t.data.cs_topos_local_key, LOCAL_KEY);
+  assert.equal(t.data.cs_topos_local_url, "http://localhost:8676");
+  assert.equal(t.data.cs_topos_expired, false);
+  // Sending starts from this moment: the baseline is stamped as the account path stamps it.
+  assert.equal(t.data.cs_topos_baseline_at, connected.baselineAt);
+  assert.ok(connected.baselineAt > 1700000000);
+  // What the popup may read never includes the key.
+  assert.deepEqual(json(await t.Local.read()), { hasKey: true, url: "http://localhost:8676", expired: false, refusal: null });
+
+  // The node's refusal comes back in its own words; nothing is stored.
+  const refused = toposHarness({});
+  refused.net.answer(401, NODE_KEY_REFUSED);
+  await assert.rejects(refused.Local.connect({ key: LOCAL_KEY, url: "" }), (err) => {
+    assert.equal(err.message.includes(NODE_KEY_REFUSED.detail.message), true);
+    assert.equal(err.message.includes("(401)"), true);
+    assert.equal(err.message.includes(LOCAL_KEY), false);
+    return true;
+  });
+  assert.equal(refused.net.calls[0].url, `${NODE}/local-pushers/me`);
+  assert.deepEqual(refused.data, {});
+
+  // The node accepts the key, but not for this extension's source.
+  const other = toposHarness({});
+  other.net.answer(200, { ...NODE_ME, sources: ["browser_visits"] });
+  await assert.rejects(other.Local.connect({ key: LOCAL_KEY, url: "" }), /may not write ChatGPT chats \(chatgpt_ui_conversation\)/);
+  assert.deepEqual(other.data, {});
+
+  // No node running.
+  const down = toposHarness({});
+  down.net.offline();
+  await assert.rejects(down.Local.connect({ key: LOCAL_KEY, url: "" }), /No Topos answered at http:\/\/127\.0\.0\.1:8676/);
+  assert.deepEqual(down.data, {});
+
+  // The key never leaves for anything but a loopback address, and a paste that
+  // is not a key is never sent at all.
+  const guarded = toposHarness({});
+  guarded.net.answer(200, NODE_ME);
+  await assert.rejects(guarded.Local.connect({ key: LOCAL_KEY, url: "https://example.test" }), /on this computer/);
+  await assert.rejects(guarded.Local.connect({ key: LOCAL_KEY, url: "http://127.0.0.1:8676@example.test" }), /on this computer/);
+  await assert.rejects(guarded.Local.connect({ key: "tpk_some-other-token", url: "" }), /starts with tpw_/);
+  await assert.rejects(guarded.Local.connect({ key: "tpw_two words", url: "" }), /starts with tpw_/);
+  await assert.rejects(guarded.Local.connect({ key: "", url: "" }), /starts with tpw_/);
+  assert.equal(guarded.net.calls.length, 0);
+  assert.deepEqual(guarded.data, {});
+});
+
+test("account: the request is the same as before the local option existed", async () => {
+  const t = toposHarness({ ...ACCOUNT });
+  t.net.answer(200, {});
+  const result = await t.Ingest.send(BATCH);
+  assert.equal(t.net.calls.length, 1);
+  assert.equal(t.net.calls[0].url, "https://cp.logu3s.com/v1/ingestion/app_ingest");
+  assert.deepEqual(t.net.calls[0].options, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Bearer account-token",
+      "Idempotency-Key": "chatgpt-shadow-2-a14d1b3a-31498b43",
+    },
+    body: JSON.stringify({ resource_id: "resource-0001", source_id: "chatgpt_ui_conversation", records: BATCH }),
+  });
+  assert.deepEqual(json(result), { ok: true, queued: false, target: "account", status: 200 });
+
+  // Every other answer maps as it did; only `target` is new.
+  t.net.answer(202, { write_id: "w-1" });
+  assert.deepEqual(json(await t.Ingest.send(BATCH)), { ok: true, queued: true, target: "account", status: 202, writeId: "w-1" });
+  for (const status of [401, 403]) {
+    t.net.answer(status, "expired");
+    assert.deepEqual(json(await t.Ingest.send(BATCH)), { ok: false, reason: "auth_expired", target: "account", status, body: "expired" });
+  }
+  t.net.answer(504, "Engine response timeout");
+  assert.deepEqual(json(await t.Ingest.send(BATCH)), {
+    ok: false,
+    reason: "unavailable",
+    retryable: true,
+    target: "account",
+    inFlight: true,
+    status: 504,
+    body: "Engine response timeout",
+  });
+  t.net.answer(500, "boom");
+  assert.deepEqual(json(await t.Ingest.send(BATCH)), {
+    ok: false,
+    reason: "server_error",
+    retryable: true,
+    target: "account",
+    status: 500,
+    body: "boom",
+  });
+  t.net.offline();
+  assert.deepEqual(json(await t.Ingest.send(BATCH)), {
+    ok: false,
+    reason: "network_error",
+    retryable: true,
+    target: "account",
+    message: "Failed to fetch",
+  });
+  // The token lifecycle stays with the caller, as before.
+  assert.deepEqual(t.data, { ...ACCOUNT });
+
+  // A Control Plane address stored at connect time is used, without its trailing slash.
+  const moved = toposHarness({ ...ACCOUNT, cs_topos_cp_url: "https://cp.example.test/" });
+  moved.net.answer(200, {});
+  await moved.Ingest.send(BATCH);
+  assert.equal(moved.net.calls[0].url, "https://cp.example.test/v1/ingestion/app_ingest");
+
+  // The size cap and the empty batch answer before any target is read.
+  const many = Array.from({ length: 201 }, (_unused, i) => ({ ...BATCH[0], id: `msg-${i}` }));
+  assert.equal((await t.Ingest.send(many)).reason, "batch_too_large");
+  assert.deepEqual(json(await t.Ingest.send([])), { ok: true, queued: false, empty: true });
+});
+
+/** A background worker whose fetch is recorded, plus a barrier for the send queue. */
+function localBackground(initial) {
+  const bg = backgroundHarness(initial);
+  const net = fakeNetwork();
+  bg.box.fetch = net.fetch;
+  // A repair send with nothing to repair queues behind any automatic send and does nothing itself.
+  const drain = () => bg.send({ type: "topos.submitRepair" });
+  const capture = async (id, createdAt) => {
+    await bg.send({
+      type: "shadow.upsert",
+      conversation: { id: "conv-0410", title: "Sample thread" },
+      messages: [{ id, role: "user", content: `sample ${id}`, index: 0, created_at: createdAt }],
+    });
+    await drain();
+  };
+  const sentIds = (call) => JSON.parse(call.options.body).records.map((row) => row.id);
+  return { bg, net, drain, capture, sentIds };
+}
+
+const LATER = Math.floor(Date.now() / 1000) + 3600;
+
+test("background: connecting a local Topos sends what is captured from then on, and history only on request", async () => {
+  const { bg, net, capture, sentIds } = localBackground({
+    cs_messages: {
+      "conv-0410": [{ id: "msg-0410", thread_id: "conv-0410", role: "user", content: "older sample", created_at: 1700000000 }],
+    },
+    cs_index: { "conv-0410": { id: "conv-0410", title: "Sample thread", messageCount: 1 } },
+  });
+  let status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target], [false, "none"]);
+
+  net.answer(200, NODE_ME);
+  const connected = await bg.send({ type: "topos.localConnect", key: LOCAL_KEY, url: "" });
+  assert.equal(connected.ok, true);
+  assert.equal(net.calls[0].url, `${NODE}/local-pushers/me`);
+  assert.equal(bg.data.cs_topos_local_key, LOCAL_KEY);
+  // The key goes in and never comes back out.
+  assert.equal(JSON.stringify(connected).includes(LOCAL_KEY), false);
+  status = await bg.send({ type: "topos.status" });
+  assert.equal(JSON.stringify(status).includes(LOCAL_KEY), false);
+  assert.deepEqual(
+    [status.connected, status.target, status.localUrl, status.accountConnected, status.expired, status.queued, status.queuedNew],
+    [true, "local", NODE, false, false, 1, 0]
+  );
+
+  // A message captured after connecting goes to the node on its own; the older one does not.
+  net.answer(200, { ...NODE_OK, records_processed: 1, records_total: 1 });
+  await capture("msg-0411", LATER);
+  assert.equal(net.calls.length, 2);
+  assert.equal(net.calls[1].url, NODE_BATCH);
+  assert.equal(net.calls[1].options.headers.Authorization, `Bearer ${LOCAL_KEY}`);
+  assert.deepEqual(sentIds(net.calls[1]), ["msg-0411"]);
+  assert.equal(JSON.stringify(bg.data.cs_topos_receipt).includes(LOCAL_KEY), false);
+
+  // Send history carries the rest.
+  const receipt = await bg.send({ type: "topos.submitHistory" });
+  assert.deepEqual(sentIds(net.calls[2]), ["msg-0410"]);
+  assert.deepEqual([receipt.total, receipt.landed, receipt.failed, receipt.error], [1, 1, 0, ""]);
+  assert.equal("unread" in receipt, false);
+
+  // Disconnect forgets the key and the address; the captured chats stay.
+  status = await bg.send({ type: "topos.disconnect" });
+  assert.deepEqual([status.connected, status.target], [false, "none"]);
+  assert.equal(Object.keys(bg.data).some((key) => key.startsWith("cs_topos")), false);
+  assert.equal(bg.data.cs_messages["conv-0410"].length, 2);
+  await capture("msg-0412", LATER + 1);
+  assert.equal(net.calls.length, 3, "nothing is sent after Disconnect");
+});
+
+test("background: the node's refusal of a pasted key is shown and nothing is stored", async () => {
+  const { bg, net } = localBackground({});
+  net.answer(401, NODE_KEY_REFUSED);
+  const refused = await bg.send({ type: "topos.localConnect", key: LOCAL_KEY, url: "" });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error.includes(NODE_KEY_REFUSED.detail.message), true);
+  assert.equal(refused.error.includes(LOCAL_KEY), false);
+  assert.equal(bg.data.cs_topos_local_key, undefined);
+
+  // An address that is not this computer is refused before anything is fetched.
+  const elsewhere = await bg.send({ type: "topos.localConnect", key: LOCAL_KEY, url: "http://example.test:8676" });
+  assert.equal(elsewhere.ok, false);
+  assert.match(elsewhere.error, /on this computer/);
+  assert.equal(net.calls.length, 1);
+});
+
+test("background: a 401 from the local node drops the key, shows expired, and nothing falls back to the account", async () => {
+  const { bg, net, capture } = localBackground({ cs_topos_local_key: LOCAL_KEY, cs_topos_baseline_at: 1, ...ACCOUNT });
+  let status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target, status.accountConnected], [true, "local", true]);
+
+  net.answer(401, NODE_KEY_REFUSED);
+  await capture("msg-0420", LATER);
+  assert.equal(net.calls.length, 1);
+  assert.equal(net.calls[0].url, NODE_BATCH);
+  assert.equal(bg.data.cs_topos_local_key, undefined);
+  assert.equal(bg.data.cs_topos_expired, "local");
+  assert.match(bg.data.cs_topos_receipt.error, /pushers add/);
+  assert.equal(JSON.stringify(bg.data.cs_topos_receipt).includes(LOCAL_KEY), false);
+  status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target, status.expired, status.localExpired], [false, "none", true, true]);
+
+  // The account token is still stored, and still not used until the person acts.
+  assert.equal(bg.data.cs_topos_token, "account-token");
+  net.answer(200, {});
+  await capture("msg-0421", LATER + 1);
+  await bg.send({ type: "topos.submitHistory" });
+  assert.equal(net.calls.length, 1);
+  assert.equal(bg.data.cs_messages["conv-0410"].every((row) => row.synced_at === undefined), true);
+
+  // A new key from the node clears the expired state and sending resumes there.
+  net.answer(200, NODE_ME);
+  assert.equal((await bg.send({ type: "topos.localConnect", key: LOCAL_KEY, url: "" })).ok, true);
+  status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target, status.expired, status.localExpired], [true, "local", false, false]);
+});
+
+test("background: a refusal from the local node is final until the person acts", async () => {
+  const { bg, net, capture, sentIds } = localBackground({ cs_topos_local_key: LOCAL_KEY, cs_topos_baseline_at: 1 });
+  net.answer(403, NODE_SOURCE_REFUSED);
+  await capture("msg-0430", LATER);
+  assert.equal(net.calls.length, 1);
+  // The key is kept, the message stays here unsent, and the node's words are kept to show.
+  assert.equal(bg.data.cs_topos_local_key, LOCAL_KEY);
+  assert.equal(bg.data.cs_messages["conv-0410"][0].synced_at, undefined);
+  assert.deepEqual(
+    { ...bg.data.cs_topos_local_refusal, at: 0 },
+    { reason: "refused", status: 403, message: NODE_SOURCE_REFUSED.message, at: 0 }
+  );
+  assert.equal(
+    bg.data.cs_topos_receipt.error,
+    `The Topos on this computer refused these messages (HTTP 403): ${NODE_SOURCE_REFUSED.message}. Nothing more is sent on its own.`
+  );
+  let status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target, status.expired], [true, "local", false]);
+  assert.equal(status.localRefusal.message, NODE_SOURCE_REFUSED.message);
+
+  // Not retried on its own, however many messages arrive.
+  net.answer(200, NODE_OK);
+  await capture("msg-0431", LATER + 1);
+  await capture("msg-0432", LATER + 2);
+  assert.equal(net.calls.length, 1);
+
+  // A send the person starts tries again; once the node takes it, sending resumes.
+  const receipt = await bg.send({ type: "topos.submitHistory" });
+  assert.deepEqual(sentIds(net.calls[1]), ["msg-0430", "msg-0431", "msg-0432"]);
+  assert.deepEqual([receipt.landed, receipt.failed, receipt.error], [3, 0, ""]);
+  assert.equal(bg.data.cs_topos_local_refusal, undefined);
+  await capture("msg-0433", LATER + 3);
+  assert.deepEqual(sentIds(net.calls[2]), ["msg-0433"]);
+
+  // A batch the node will never take stops the automatic path the same way.
+  net.answer(422, { status: "error", error: "all_records_failed", message: "All 1 record(s) failed ingestion" });
+  await capture("msg-0434", LATER + 4);
+  assert.equal(bg.data.cs_topos_local_refusal.reason, "rejected");
+  assert.equal(bg.data.cs_topos_local_key, LOCAL_KEY);
+  net.answer(200, NODE_OK);
+  await capture("msg-0435", LATER + 5);
+  assert.equal(net.calls.length, 4);
+});
+
+test("background: a local node that is busy or not running keeps the records and resends the same write", async () => {
+  const { bg, net, capture } = localBackground({ cs_topos_local_key: LOCAL_KEY, cs_topos_baseline_at: 1 });
+  net.answer(503, "busy");
+  await capture("msg-0440", LATER);
+  assert.equal(net.calls.length, 1);
+  assert.equal(bg.data.cs_topos_local_key, LOCAL_KEY);
+  assert.equal(bg.data.cs_topos_local_refusal, undefined);
+  assert.equal(bg.data.cs_topos_expired, undefined);
+  assert.equal(bg.data.cs_messages["conv-0410"][0].synced_at, undefined);
+  assert.match(bg.data.cs_topos_receipt.error, /HTTP 503/);
+
+  net.offline();
+  let receipt = await bg.send({ type: "topos.submitHistory" });
+  assert.deepEqual([receipt.landed, receipt.failed], [0, 1]);
+  assert.match(receipt.error, /did not answer/);
+  assert.equal(bg.data.cs_topos_local_key, LOCAL_KEY);
+
+  net.answer(200, { ...NODE_OK, records_processed: 1, records_total: 1 });
+  receipt = await bg.send({ type: "topos.submitHistory" });
+  assert.deepEqual([receipt.landed, receipt.failed, receipt.error], [1, 0, ""]);
+  const writeIds = net.calls.map((call) => JSON.parse(call.options.body).write_id);
+  assert.equal(writeIds.length, 3);
+  assert.equal(new Set(writeIds).size, 1, "every retry of the same records carries one write_id");
+  assert.ok(bg.data.cs_messages["conv-0410"][0].synced_at > 0);
+});
+
+test("background: records the local node could not read are counted, not resent", async () => {
+  const { bg, net, capture } = localBackground({ cs_topos_local_key: LOCAL_KEY, cs_topos_baseline_at: 1 });
+  net.answer(200, { ...NODE_OK, records_processed: 0, records_total: 1, errors: [{ index: 0, error: "ingest failed" }] });
+  await capture("msg-0450", LATER);
+  assert.deepEqual(
+    { ...bg.data.cs_topos_receipt, at: 0 },
+    { mode: "auto", total: 1, landed: 0, queued: 0, failed: 0, unread: 1, error: "", at: 0 }
+  );
+  assert.ok(bg.data.cs_messages["conv-0410"][0].synced_at > 0);
+});
+
+test("background: with only an account connected, sends go to the Control Plane as before", async () => {
+  const { bg, net, capture, sentIds } = localBackground({ ...ACCOUNT, cs_topos_baseline_at: 1 });
+  let status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target, status.accountConnected], [true, "account", true]);
+  net.answer(200, {});
+  await capture("msg-0460", LATER);
+  assert.equal(net.calls.length, 1);
+  assert.equal(net.calls[0].url, "https://cp.logu3s.com/v1/ingestion/app_ingest");
+  assert.equal(net.calls[0].options.headers.Authorization, "Bearer account-token");
+  assert.deepEqual(sentIds(net.calls[0]), ["msg-0460"]);
+  assert.deepEqual(
+    { ...bg.data.cs_topos_receipt, at: 0 },
+    { mode: "auto", total: 1, landed: 1, queued: 0, failed: 0, error: "", at: 0 }
+  );
+
+  // A rejected token is dropped and marked expired exactly as before.
+  net.answer(401, "expired");
+  await capture("msg-0461", LATER + 1);
+  assert.equal(bg.data.cs_topos_token, undefined);
+  assert.equal(bg.data.cs_topos_resource_id, undefined);
+  assert.equal(bg.data.cs_topos_expired, true);
+  assert.equal(bg.data.cs_topos_receipt.error, "Topos rejected the token. Connect again.");
+  status = await bg.send({ type: "topos.status" });
+  assert.deepEqual([status.connected, status.target, status.expired, status.localExpired], [false, "none", true, false]);
 });

@@ -19,7 +19,7 @@
 <p align="center">
   User turns and assistant replies are captured from the page, including a past thread when you open it.<br />
   Capture is local by default: the copy lives in extension storage on this machine.<br />
-  Nothing leaves the browser unless you connect a Topos account.
+  No chat leaves the browser unless you connect a Topos: through an account, or a node on this computer with no account.
 </p>
 
 ---
@@ -32,12 +32,13 @@ ChatGPT already holds a large share of working memory, but that text leaves the 
 |--------|----------------|
 | **Live capture** | New user and assistant turns appear in the popup without a reload. |
 | **Open a past thread** | Opening an existing chat stores every visible turn, deduped by message id. |
-| **Local by default** | Data stays in `chrome.storage.local`. No analytics, and no network call of any kind until you connect an account. |
+| **Local by default** | Data stays in `chrome.storage.local`. No analytics, and no chat is sent anywhere until you connect a Topos. |
 | **Optional Topos sync** | Connect your own Topos and messages captured from then on are sent as they settle. Anything captured before you connected is sent only when you press **Send history**. |
+| **No account needed** | A Topos running on this computer can take your chats directly. See [Local first](#local-first-a-topos-with-no-account). |
 | **Export JSONL** | One file per conversation, or everything at once. The same file imports into Topos. |
 | **Pause and clear** | Uncheck **Capture chats** to stop writing. **Clear** deletes the local copy. |
 
-This is a standalone browser extension. Connecting is optional and off until you do it; the Topos Control Plane is the only network destination it ever contacts.
+This is a standalone browser extension. Connecting is optional and off until you do it. Chats are only ever sent to the Topos you connected: the Topos Control Plane when you connect an account, or an address on this computer (`http://127.0.0.1:8676` unless you change it) when you connect a local Topos. The one other request the extension makes is a version check: opening the popup reads this repository's `manifest.json` from GitHub, and that request carries nothing from your chats.
 
 ---
 
@@ -136,6 +137,36 @@ If a send fails because your node is slow or unreachable, the records stay queue
 
 ---
 
+## Local first: a Topos with no account
+
+Optional, and separate from the account path above, which is unchanged. A Topos node running on this computer (topos-node 1.5.46 or later) can take your chats directly: no Dialogues account, and no Control Plane in between.
+
+```text
+  ChatGPT page  →  Extension  →  http://127.0.0.1:8676  (your Topos node, on this computer)
+```
+
+1. **Load the extension** (see [Install from GitHub](#install-from-github)), open the popup, and open **Local Topos (no account)** under **Topos**.
+2. **Run the command it shows in your own terminal**, and say yes when Topos asks. The command is filled in for this install; **Copy** copies it. It looks like
+
+   ```bash
+   topos-node pushers add chatgpt-shadow-extension --sources chatgpt_ui_conversation --origin chrome-extension://<this extension's id>
+   ```
+
+   Topos then shows a key, once.
+3. **Paste the key** into **Key** and press **Connect local Topos**. The extension asks the node what the key may write, and saves it only if the node accepts it for ChatGPT chats. If the node says no, the popup shows the node's own words and nothing is saved.
+
+From then on it behaves like an account connection. Messages captured after you connected are sent as they settle; earlier ones go only when you press **Send history**; the held table and the two rules above apply the same way. Each batch carries an id that stays the same when it is resent, so a retry writes nothing twice.
+
+What leaves the browser in this mode: your chats go to one address, your node's, on this computer. That address is `http://127.0.0.1:8676` unless you change it under **Address**, and only `http://127.0.0.1:<port>` or `http://localhost:<port>` is accepted. No chat leaves the computer, and no Dialogues server is contacted. The key is kept in `chrome.storage.local` on this machine and is sent only to that address.
+
+- **A local key wins.** If an account is connected as well, chats go only to the node on this computer while the key is saved.
+- **Disconnect** forgets the key (and any account connection) and stops all sending. Your captured chats stay in the extension. To switch the extension off on the Topos side as well, run `topos-node pushers disconnect chatgpt-shadow-extension`.
+- **If the node stops accepting the key** (you disconnected the extension there, or a different node now answers), the key is deleted, the toolbar badge turns red, and nothing is sent until you run the command again and paste the new key. An account you connected earlier is not used in its place.
+- **If the node says no to a batch**, the popup shows what it said and nothing more is sent on its own. Press **Send history** to try again, or run the command again and paste the new key.
+- **If the node is not running**, the records stay queued in the extension and go out on a later attempt.
+
+---
+
 ## What it captures
 
 - Hosts: `chatgpt.com`, `chat.openai.com` (including `/c/...` threads and `/share/...` copies)
@@ -174,18 +205,20 @@ The five turn fields are frozen: the exported file and the records sent to Topos
 
 Data lives in `chrome.storage.local` under `cs_index` and `cs_messages`. That is extension storage, not the ChatGPT page’s `localStorage`. The extension requests `unlimitedStorage` so long threads are not silently dropped at 10MB.
 
-Connection state lives beside it under `cs_topos_*`, including the attach token. **Disconnect** removes every one of those keys.
+Connection state lives beside it under `cs_topos_*`, including the attach token or the local key. **Disconnect** removes every one of those keys.
 
 ---
 
 ## Privacy
 
 - Capture can be paused. The local store can be cleared in one click.
-- Until you connect an account, the extension makes no network calls of its own. It reads the ChatGPT page in the tab you already opened and writes to `chrome.storage.local`.
-- Connecting is explicit, per install, and reversible. The attach token is stored in `chrome.storage.local` on this machine; it is not put in `chrome.storage.sync`, so it does not travel to your other browser profiles.
+- Until you connect a Topos, no chat is sent anywhere. The extension reads the ChatGPT page in the tab you already opened and writes to `chrome.storage.local`.
+- Opening the popup checks for a newer version by reading this repository's `manifest.json` from GitHub. That request carries nothing from your chats.
+- Connecting is explicit, per install, and reversible. The attach token, or the local key, is stored in `chrome.storage.local` on this machine; it is not put in `chrome.storage.sync`, so it does not travel to your other browser profiles.
+- With a local Topos, chats are sent to an address on this computer and nowhere else. See [Local first](#local-first-a-topos-with-no-account).
 - Once connected, messages captured from then on are sent to your own Topos. Messages captured before you connected are sent only when you press **Send history**. See the held table above for what is never sent automatically.
-- **Disconnect** deletes the token and stops all sending. It does not delete the local copy; **Clear** does that.
-- No remote code. No analytics. No writes to the ChatGPT origin store. The Control Plane is the only host contacted, and only after you connect.
+- **Disconnect** deletes the token and the local key and stops all sending. It does not delete the local copy; **Clear** does that.
+- No remote code. No analytics. No writes to the ChatGPT origin store. Chats go to one place, and only after you connect it: the Control Plane for an account, or an address on this computer for a local Topos.
 
 ---
 
@@ -205,8 +238,9 @@ node --test tests/shadow.test.mjs
 | Old thread missing turns | Open the thread so visible messages can be copied. Sidebar history is not crawled. |
 | Export is empty | Capture at least one turn, or reopen a thread, then export again. |
 | Selectors miss messages after a ChatGPT redesign | Update `extract.js`, then reload the extension and the tab. |
-| Red **!** on the toolbar icon | The attach token was rejected and has been deleted. Open the popup and press **Reconnect**. |
-| Amber **!** on the toolbar icon | Your node did not answer the last few sends. Records stay queued in the extension; nothing was lost. |
+| Red **!** on the toolbar icon | The attach token was rejected and has been deleted. Open the popup and press **Reconnect**. With a local Topos: the node no longer accepts the key; run the command under **Local Topos** again and paste the new key. |
+| Amber **!** on the toolbar icon | Your node did not answer the last few sends. Records stay queued in the extension; nothing was lost. With a local Topos it can also mean the node said no to a batch; the popup shows what it said. |
+| **No Topos answered** when connecting a local Topos | Check that Topos is running on this computer, and that **Address** matches where it listens. |
 | **Send history** count never reaches zero | Some rows are held on purpose. The popup line under **Topos** says how many, and the held table above says why. |
 | Debug logging | `chrome://extensions` → **ChatGPT Shadow** → **Service worker** → Console. |
 
@@ -223,7 +257,8 @@ node --test tests/shadow.test.mjs
 | Background writer and sender | `background.js` |
 | Connection constants | `lib/toposConfig.js` |
 | PKCE attach flow | `lib/toposAuth.js` |
-| `app_ingest` client | `lib/toposIngest.js` |
+| Local Topos key: check, store, forget | `lib/toposLocal.js` |
+| Where a send goes, and the two senders (`app_ingest`, the local node) | `lib/toposIngest.js` |
 | Tests | `tests/shadow.test.mjs` |
 
 Every file is a classic script that assigns itself to `globalThis`; the service worker loads them with `importScripts` and the test suite loads the same files into one `vm` sandbox. There is no bundler and no ES module in the extension.

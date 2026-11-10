@@ -1,7 +1,15 @@
-importScripts("extract.js", "store.js", "lib/toposConfig.js", "lib/toposAuth.js", "lib/toposIngest.js");
+importScripts(
+  "extract.js",
+  "store.js",
+  "lib/toposConfig.js",
+  "lib/toposAuth.js",
+  "lib/toposLocal.js",
+  "lib/toposIngest.js"
+);
 
 const ToposConfig = ChatGPTShadowToposConfig;
 const ToposAuth = ChatGPTShadowToposAuth;
+const ToposLocal = ChatGPTShadowToposLocal;
 const ToposIngest = ChatGPTShadowToposIngest;
 const TOPOS_KEYS = ToposConfig.KEYS;
 
@@ -136,6 +144,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  // The key arrives from the popup and goes straight to storage once the node
+  // accepts it. It is never logged and never sent back.
+  if (message.type === "topos.localConnect") {
+    toposLocalConnect(message.key, message.url).then(sendResponse);
+    return true;
+  }
+
+  // Forgets the account token and the local key alike: Disconnect stops all sending.
   if (message.type === "topos.disconnect") {
     ToposAuth.disconnect()
       .then(() => refreshBadge())
@@ -185,6 +201,7 @@ async function refreshBadge(state) {
   const stored = await chrome.storage.local.get({
     [TOPOS_KEYS.expired]: false,
     [TOPOS_KEYS.engineWarning]: false,
+    [TOPOS_KEYS.localRefusal]: null,
     cs_extract_miss: null,
   });
   if (stored[TOPOS_KEYS.expired]) {
@@ -192,7 +209,7 @@ async function refreshBadge(state) {
     await chrome.action.setBadgeText({ text: "!" });
     return;
   }
-  if (stored[TOPOS_KEYS.engineWarning]) {
+  if (stored[TOPOS_KEYS.engineWarning] || stored[TOPOS_KEYS.localRefusal]) {
     await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
     await chrome.action.setBadgeText({ text: "!" });
     return;
@@ -223,7 +240,8 @@ function broadcast(payload) {
 
 function autoOptions(auth) {
   // Automatic path: real message ids only, and only what was captured after the
-  // account was attached. Anything older is backlog for the history button.
+  // account was attached or the local key was accepted. Anything older is backlog
+  // for the history button.
   // Thread-id corrections rewrite rows the node already holds: never automatic.
   return { includeDerived: false, since: auth.baselineAt || 0, skipStreaming: true, repair: "hold" };
 }
@@ -242,14 +260,39 @@ function optionsFor(mode, auth) {
   return autoOptions(auth);
 }
 
-async function toposStatus() {
+/**
+ * The account state, plus where sends go now. `connected` is true for either
+ * target: a local key (which wins) or an account token. Never carries the key.
+ */
+async function readConnection() {
   const auth = await ToposAuth.read();
+  const local = await ToposLocal.read();
+  const where = await ToposIngest.target();
+  return {
+    ...auth,
+    connected: where.mode !== "none",
+    target: where.mode,
+    accountConnected: auth.connected,
+    localUrl: local.url,
+    localExpired: local.expired,
+    localRefusal: where.mode === "local" ? local.refusal : null,
+  };
+}
+
+async function toposStatus() {
+  const auth = await readConnection();
   const state = await readState();
   const history = ChatGPTShadowStore.syncScan(state, historyOptions());
   const auto = ChatGPTShadowStore.syncScan(state, autoOptions(auth));
   const repair = ChatGPTShadowStore.syncScan(state, repairOptions());
   return {
     connected: auth.connected,
+    // "local": a Topos on this computer. "account": through the Control Plane. "none".
+    target: auth.target,
+    accountConnected: auth.accountConnected,
+    localUrl: auth.localUrl,
+    localExpired: auth.localExpired,
+    localRefusal: auth.localRefusal,
     expired: auth.expired,
     engineWarning: auth.engineWarning,
     connecting: connectRunning,
@@ -282,6 +325,29 @@ async function toposConnect() {
     await chrome.storage.local.set({ [TOPOS_KEYS.lastError]: error });
     broadcast({ type: "topos.changed" });
     return { ok: false, error };
+  } finally {
+    connectRunning = false;
+  }
+}
+
+/**
+ * Local Topos, no account: check the pasted key with the node on this computer
+ * and store it only when the node accepts it. The error is the node's own
+ * refusal, or why nothing answered; it never contains the key.
+ */
+async function toposLocalConnect(key, url) {
+  if (connectRunning) return { ok: false, error: "A connection attempt is already open." };
+  connectRunning = true;
+  try {
+    await ToposLocal.connect({ key, url });
+    sendFailureStreak = 0;
+    nextAutoSyncAt = 0;
+    await refreshBadge();
+    const status = await toposStatus();
+    broadcast({ type: "topos.changed" });
+    return { ok: true, status };
+  } catch (err) {
+    return { ok: false, error: (err && err.message) || String(err) };
   } finally {
     connectRunning = false;
   }
@@ -323,8 +389,32 @@ async function setEngineWarning(show) {
   await refreshBadge();
 }
 
+/** The same failures in the words of a node that is on this computer. */
+function describeLocalFailure(result) {
+  // The node's own words, closed with a full stop when it left one out.
+  const words = String(result.message || "").trim();
+  const said = words ? `: ${words}${/[.!?]$/.test(words) ? "" : "."}` : ".";
+  if (result.reason === "auth_expired") {
+    return "The Topos on this computer no longer accepts this extension's key. Run the topos-node pushers add command again and paste the new key.";
+  }
+  if (result.reason === "refused") {
+    return `The Topos on this computer refused these messages (HTTP ${result.status})${said} Nothing more is sent on its own.`;
+  }
+  if (result.reason === "rejected") {
+    return `The Topos on this computer could not take these messages (HTTP ${result.status})${said} Nothing more is sent on its own.`;
+  }
+  if (result.reason === "network_error") {
+    return "The Topos on this computer did not answer. Is it running? Unsent records stay queued here.";
+  }
+  if (result.reason === "unavailable") {
+    return `The Topos on this computer is not ready (HTTP ${result.status}). Unsent records stay queued here.`;
+  }
+  return "Send failed.";
+}
+
 function describeFailure(result) {
   if (!result) return "Send failed.";
+  if (result.target === "local") return describeLocalFailure(result);
   if (result.reason === "auth_expired") return "Topos rejected the token. Connect again.";
   if (result.reason === "unavailable") {
     return result.inFlight
@@ -343,8 +433,14 @@ function describeFailure(result) {
  * mode "repair"  only the thread-id corrections, user-initiated only
  */
 async function runSync(mode) {
-  const auth = await ToposAuth.read();
+  const auth = await readConnection();
   if (!auth.connected) return { mode, skipped: "not_connected", total: 0, landed: 0, queued: 0, failed: 0 };
+
+  // The local node gave a final "no" to the last batch. Nothing goes on its own
+  // until the person acts: a send they start themselves, a new key, or Disconnect.
+  if (mode === "auto" && auth.localRefusal) {
+    return { mode, skipped: "refused", total: 0, landed: 0, queued: 0, failed: 0 };
+  }
 
   // No baseline on record means the automatic path has no way to tell a new
   // message from the backlog. Stamp one now and send nothing this round, so a
@@ -362,6 +458,9 @@ async function runSync(mode) {
   const batches = ChatGPTShadowStore.chunkRecords(scan.records, ToposConfig.MAX_BATCH);
   let landed = 0;
   let queued = 0;
+  // Local node only: records it answered it could not read. They are not resent.
+  let unread = 0;
+  let refusalOpen = Boolean(auth.localRefusal);
   let error = "";
   syncRunning = true;
   try {
@@ -373,10 +472,17 @@ async function runSync(mode) {
         await applyChange((current) =>
           ChatGPTShadowStore.markSynced(current, batch, Math.floor(Date.now() / 1000))
         );
+        const skipped = result.unread || 0;
+        unread += skipped;
         if (result.queued) queued += batch.length;
-        else landed += batch.length;
+        else landed += batch.length - skipped;
         // The node answered, so lift any backoff a previous failure put in place.
         nextAutoSyncAt = 0;
+        if (refusalOpen) {
+          refusalOpen = false;
+          await ToposLocal.clearRefusal();
+          await refreshBadge();
+        }
         if (sendFailureStreak) {
           sendFailureStreak = 0;
           await setEngineWarning(false);
@@ -385,7 +491,14 @@ async function runSync(mode) {
       }
       error = describeFailure(result);
       if (result.reason === "auth_expired") {
-        await ToposAuth.markExpired();
+        // The dead credential is dropped, the local key or the account token.
+        if (result.target === "local") await ToposLocal.markExpired();
+        else await ToposAuth.markExpired();
+        await refreshBadge();
+      } else if (result.final) {
+        // The local node said no for good. Not a connection problem, so no backoff
+        // and no streak: the records stay here and the automatic path stops.
+        await ToposLocal.markRefused(result);
         await refreshBadge();
       } else {
         sendFailureStreak += 1;
@@ -404,7 +517,8 @@ async function runSync(mode) {
     total,
     landed,
     queued,
-    failed: total - landed - queued,
+    failed: total - landed - queued - unread,
+    ...(unread ? { unread } : {}),
     error,
     at: Date.now(),
   };

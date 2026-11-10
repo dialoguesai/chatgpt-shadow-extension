@@ -18,10 +18,28 @@ const toposSendHistory = document.getElementById("toposSendHistory");
 const toposFixLinks = document.getElementById("toposFixLinks");
 const toposProgress = document.getElementById("toposProgress");
 const toposReceipt = document.getElementById("toposReceipt");
+const localTopos = document.getElementById("localTopos");
+const localNote = document.getElementById("localNote");
+const localSetup = document.getElementById("localSetup");
+const localCommand = document.getElementById("localCommand");
+const localCopy = document.getElementById("localCopy");
+const localKey = document.getElementById("localKey");
+const localUrl = document.getElementById("localUrl");
+const localConnect = document.getElementById("localConnect");
+const localStatus = document.getElementById("localStatus");
+const ToposConfig = ChatGPTShadowToposConfig;
 
 let state = { enabled: true, conversations: [], messages: {}, messageCount: 0 };
 let topos = null;
 let selectedId = "";
+let localOpened = false;
+let localUrlShown = false;
+
+// The node answers only the exact origin named when the person enrolled this
+// extension, so the command carries this install's own id.
+localCommand.textContent = ToposConfig.enrollCommand(chrome.runtime.id);
+localKey.placeholder = `${ToposConfig.LOCAL_KEY_PREFIX}${ToposConfig.APP_ID}.…`;
+localUrl.placeholder = ToposConfig.DEFAULT_LOCAL_URL;
 
 enabled.addEventListener("change", () => {
   chrome.runtime.sendMessage({ type: "shadow.setEnabled", enabled: enabled.checked }, refresh);
@@ -85,6 +103,65 @@ toposDisconnect.addEventListener("click", () => {
     toposProgress.hidden = true;
     toposReceipt.hidden = true;
     renderTopos();
+  });
+});
+
+localCopy.addEventListener("click", () => {
+  const said = (text) => {
+    localCopy.textContent = text;
+    window.setTimeout(() => {
+      localCopy.textContent = "Copy";
+    }, 1500);
+  };
+  // Without clipboard access, leave the command selected so one keystroke copies it.
+  const select = () => {
+    const range = document.createRange();
+    range.selectNodeContents(localCommand);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    said("Selected");
+  };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(localCommand.textContent).then(() => said("Copied"), select);
+  } else {
+    select();
+  }
+});
+
+function sayLocal(text, isError) {
+  localStatus.hidden = !text;
+  localStatus.classList.toggle("err", Boolean(isError));
+  localStatus.textContent = text || "";
+}
+
+localConnect.addEventListener("click", () => {
+  const key = localKey.value.trim();
+  if (!key) {
+    sayLocal("Paste the key the terminal showed.", true);
+    return;
+  }
+  const address = ToposConfig.localNodeUrl(localUrl.value);
+  if (!address.ok) {
+    sayLocal(address.error, true);
+    return;
+  }
+  // The background worker checks the key with the node and stores it; this
+  // popup keeps no copy. The answer is the node's own words when it says no.
+  localConnect.disabled = true;
+  sayLocal("Checking the key with the Topos on this computer…");
+  chrome.runtime.sendMessage({ type: "topos.localConnect", key, url: address.url }, (result) => {
+    void chrome.runtime.lastError;
+    localConnect.disabled = false;
+    if (result && result.ok) {
+      localKey.value = "";
+      sayLocal("");
+      toposProgress.hidden = true;
+      toposReceipt.hidden = true;
+    } else {
+      sayLocal((result && result.error) || "Could not connect. Try again.", true);
+    }
+    refreshTopos();
   });
 });
 
@@ -200,6 +277,7 @@ function showReceipt(receipt) {
   const parts = [];
   if (receipt.landed) parts.push(`${receipt.landed} written to your node`);
   if (receipt.queued) parts.push(`${receipt.queued} queued for your node (it is offline)`);
+  if (receipt.unread) parts.push(`${receipt.unread} your node could not read (not sent again)`);
   if (receipt.failed) parts.push(`${receipt.failed} still waiting here`);
   toposReceipt.textContent = `${parts.join(" · ") || "Nothing sent"}.${receipt.error ? ` ${receipt.error}` : ""}`;
 }
@@ -217,10 +295,17 @@ function renderTopos() {
   toposFixLinks.disabled = !repairQueued || Boolean(topos.syncing);
   toposFixLinks.textContent = repairQueued ? `Fix chat links (${repairQueued})` : "Fix chat links";
 
+  const local = topos.target === "local";
+  const refusal = local ? topos.localRefusal : null;
+
   if (topos.expired) {
     toposState.textContent = "Reconnect";
     toposState.dataset.state = "err";
-    toposConnect.textContent = "Reconnect";
+    // A local key is replaced by pasting a new one below, not by signing in.
+    toposConnect.textContent = topos.localExpired ? "Connect" : "Reconnect";
+  } else if (connected && refusal) {
+    toposState.textContent = "Refused";
+    toposState.dataset.state = "warn";
   } else if (connected && topos.engineWarning) {
     toposState.textContent = "Node offline";
     toposState.dataset.state = "warn";
@@ -233,11 +318,21 @@ function renderTopos() {
     toposConnect.textContent = "Connect";
   }
 
-  if (topos.expired) {
+  if (topos.expired && topos.localExpired) {
+    toposDetail.textContent =
+      "The Topos on this computer no longer accepts this extension's key. Nothing is being sent. " +
+      "Run the command under Local Topos again and paste the new key.";
+  } else if (topos.expired) {
     toposDetail.textContent = "Your Topos connection expired. Nothing is being sent. Connect again to resume.";
   } else if (!connected) {
     toposDetail.textContent =
-      "Capture stays in this browser. Connect an account to sync new messages to your own Topos.";
+      "Capture stays in this browser. Connect an account, or a Topos on this computer, to sync new messages to your own Topos.";
+  } else if (refusal) {
+    const words = String(refusal.message || "").trim();
+    toposDetail.textContent =
+      `The Topos on this computer said no to the last send (HTTP ${refusal.status})` +
+      (words ? `: ${words}${/[.!?]$/.test(words) ? "" : "."}` : ".") +
+      " Nothing more is sent on its own. Press Send history to try again, or run the command under Local Topos again and paste the new key.";
   } else {
     const held = topos.held || {};
     const waiting = [];
@@ -258,6 +353,7 @@ function renderTopos() {
       ? ` ${nodeSide} message${nodeSide === 1 ? " is" : "s are"} filed on your node under a chat this extension cannot correct; nothing is resent for ${nodeSide === 1 ? "it" : "them"}.`
       : "";
     toposDetail.textContent =
+      (local ? "Sending to the Topos on this computer. " : "") +
       `New messages sync automatically. ${backlog}` +
       (waiting.length ? ` Holding ${waiting.join(" and ")}.` : "") +
       repairLine +
@@ -270,6 +366,29 @@ function renderTopos() {
     toposProgress.textContent = topos.lastError;
   }
   if (topos.receipt && toposReceipt.hidden) showReceipt(topos.receipt);
+  renderLocal();
+}
+
+function renderLocal() {
+  const local = topos.target === "local";
+  localSetup.hidden = local;
+  localNote.hidden = !local;
+  if (local) {
+    localNote.textContent =
+      `Connected to the Topos on this computer at ${topos.localUrl}. Chats are sent there and nowhere else.` +
+      (topos.accountConnected ? " Your account is still connected, but it is not used while this key is saved." : "") +
+      ` To switch this off on the Topos side as well, run: topos-node pushers disconnect ${ToposConfig.APP_ID}`;
+  }
+  // Show a changed address once; after that the field belongs to the person.
+  if (!localUrlShown && topos.localUrl && topos.localUrl !== ToposConfig.DEFAULT_LOCAL_URL) {
+    localUrl.value = topos.localUrl;
+  }
+  localUrlShown = true;
+  // Open the section when it is the one in use or the one that needs attention.
+  if (!localOpened && (local || topos.localExpired)) {
+    localTopos.open = true;
+    localOpened = true;
+  }
 }
 
 function counts(rows) {

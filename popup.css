@@ -294,6 +294,17 @@ button:hover {
   background: #a11f1f;
 }
 
+.pill[data-state="unsent"] {
+  color: #fff;
+  background: #1a66d6;
+}
+
+.fine.unsent {
+  color: #0f3f8c;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
 button[disabled] {
   opacity: 0.55;
   cursor: default;

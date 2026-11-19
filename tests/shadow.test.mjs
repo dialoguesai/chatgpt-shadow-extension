@@ -1273,7 +1273,7 @@ test("messages whose markup names another saved chat than the URL are dropped", 
 // browser APIs, so the messages they exchange are what the tests read.
 // ---------------------------------------------------------------------------
 
-function contentHarness(href, page) {
+function contentHarness(href, page, storedValues = {}) {
   let now = 1_000_000;
   let seq = 0;
   let pollAt = Infinity;
@@ -1281,6 +1281,7 @@ function contentHarness(href, page) {
   let onMutate = () => {};
   const timers = [];
   const sent = [];
+  const changeListeners = [];
   const view = { page };
   const chip = { dataset: {}, textContent: "" };
   const location = {
@@ -1343,8 +1344,8 @@ function contentHarness(href, page) {
         },
       },
       storage: {
-        local: { get: (defaults, callback) => callback({ ...defaults }), set() {}, remove() {} },
-        onChanged: { addListener() {} },
+        local: { get: (defaults, callback) => callback({ ...defaults, ...storedValues }), set() {}, remove() {} },
+        onChanged: { addListener: (fn) => changeListeners.push(fn) },
       },
     },
   };
@@ -1355,6 +1356,8 @@ function contentHarness(href, page) {
     sent,
     location,
     view,
+    chip,
+    storageChanged: (changes) => changeListeners.forEach((fn) => fn(changes, "local")),
     mutate: () => onMutate(),
     advance(ms) {
       const end = now + ms;
@@ -1441,6 +1444,7 @@ test("content script: messages the markup files under another saved chat are nev
 function backgroundHarness(initial) {
   const data = JSON.parse(JSON.stringify(initial || {}));
   const listeners = { installed: [], startup: [], message: [] };
+  const badge = { color: "", text: "", title: "" };
   const copy = (value) => (value === undefined ? value : JSON.parse(JSON.stringify(value)));
   const box = {
     console,
@@ -1484,7 +1488,17 @@ function backgroundHarness(initial) {
         },
         getURL: (file) => `chrome-extension://test-extension/${file}`,
       },
-      action: { async setBadgeBackgroundColor() {}, async setBadgeText() {} },
+      action: {
+        async setBadgeBackgroundColor({ color }) {
+          badge.color = color;
+        },
+        async setBadgeText({ text }) {
+          badge.text = text;
+        },
+        async setTitle({ title }) {
+          badge.title = title;
+        },
+      },
     },
   };
   box.globalThis = box;
@@ -1498,7 +1512,7 @@ function backgroundHarness(initial) {
     });
   // setEnabled queues behind every earlier store write, so it doubles as a barrier.
   const settle = () => send({ type: "shadow.setEnabled", enabled: true });
-  return { data, listeners, send, settle };
+  return { data, listeners, send, settle, badge };
 }
 
 test("background: install and startup run the repair, and the archive is written and kept", async () => {
@@ -1568,4 +1582,291 @@ test("background: a remap message moves only the ids it names", async () => {
   assert.deepEqual(bg.data.cs_messages["conv-D"].map((row) => row.id), ["msg-0310"]);
   assert.deepEqual(bg.data.cs_messages["pending:1"].map((row) => row.id), ["msg-0311"]);
   assert.equal(bg.data.cs_index["pending:1"].unassigned, true);
+});
+
+// ---------------------------------------------------------------------------
+// An install that holds captured messages and was never connected must not look
+// like a connected one: toolbar badge, page chip and popup.
+// ---------------------------------------------------------------------------
+
+const BADGE_NOT_SENDING = { color: "#1a66d6", text: "↑!" };
+const BADGE_COUNT = "#444444";
+const TOKEN = { cs_topos_token: "sample-token", cs_topos_resource_id: "sample-resource", cs_topos_baseline_at: 500 };
+
+function unsentStore(extra = {}) {
+  return {
+    cs_messages: {
+      "conv-A": [
+        { id: "msg-0401", thread_id: "conv-A", role: "user", content: "x", created_at: 100 },
+        { id: "msg-0402", thread_id: "conv-A", role: "assistant", content: "y", created_at: 101 },
+      ],
+    },
+    ...extra,
+  };
+}
+
+async function started(initial) {
+  const bg = backgroundHarness(initial);
+  bg.listeners.startup[0]();
+  await bg.settle();
+  return bg;
+}
+
+const shown = (bg) => ({ color: bg.badge.color, text: bg.badge.text });
+
+test("badge: unsent messages and no token show the not-sending state, not the count", async () => {
+  const bg = await started(unsentStore());
+  assert.deepEqual(shown(bg), BADGE_NOT_SENDING);
+  assert.match(bg.badge.title, /2 messages stored here, none sent to Topos/);
+  assert.equal(bg.data.cs_not_sending, true);
+  const status = await bg.send({ type: "topos.status" });
+  assert.equal(status.connected, false);
+  assert.equal(status.notSending, true);
+  assert.equal(status.localOnly, false);
+  assert.equal(status.queued, 2);
+});
+
+test("badge: the same unsent messages with a token show the plain count", async () => {
+  const bg = await started(unsentStore(TOKEN));
+  assert.deepEqual(shown(bg), { color: BADGE_COUNT, text: "2" });
+  assert.equal(bg.badge.title, "ChatGPT Shadow");
+  assert.equal(bg.data.cs_not_sending, undefined);
+  const status = await bg.send({ type: "topos.status" });
+  assert.equal(status.connected, true);
+  assert.equal(status.notSending, false);
+});
+
+test("badge: the local-only choice silences the not-sending state", async () => {
+  const chosen = await started(unsentStore({ cs_local_only: true }));
+  assert.deepEqual(shown(chosen), { color: BADGE_COUNT, text: "2" });
+  assert.equal(chosen.data.cs_not_sending, undefined);
+
+  // The popup's Keep local only button, on an install that was warning.
+  const bg = await started(unsentStore());
+  assert.deepEqual(shown(bg), BADGE_NOT_SENDING);
+  const status = await bg.send({ type: "topos.setLocalOnly", localOnly: true });
+  assert.equal(bg.data.cs_local_only, true);
+  assert.equal(status.localOnly, true);
+  assert.equal(status.notSending, false);
+  assert.equal(status.queued, 2, "the count is still reported");
+  assert.deepEqual(shown(bg), { color: BADGE_COUNT, text: "2" });
+  assert.equal(bg.badge.title, "ChatGPT Shadow");
+  assert.equal(bg.data.cs_not_sending, undefined);
+
+  // A later capture does not bring the warning back.
+  await bg.send({ type: "shadow.upsert", conversation: { id: "conv-B" }, messages: [{ id: "msg-0403", role: "user", content: "z", index: 0 }] });
+  assert.deepEqual(shown(bg), { color: BADGE_COUNT, text: "3" });
+});
+
+test("badge: an expired connection takes precedence over not sending", async () => {
+  const bg = await started(unsentStore({ cs_topos_expired: true }));
+  assert.deepEqual(shown(bg), { color: "#c00000", text: "!" });
+  assert.equal(bg.data.cs_not_sending, undefined);
+  const status = await bg.send({ type: "topos.status" });
+  assert.equal(status.expired, true);
+  assert.equal(status.notSending, false);
+});
+
+test("badge: the node warning and an unreadable chat take precedence over not sending", async () => {
+  const engine = await started(unsentStore({ cs_topos_engine_warning: true }));
+  assert.deepEqual(shown(engine), { color: "#dd9900", text: "!" });
+  const miss = await started(unsentStore({ cs_extract_miss: { at: 1, path: "/c/sample" } }));
+  assert.deepEqual(shown(miss), { color: "#dd9900", text: "?" });
+  // The page chip still says it: the flag follows the state, not the badge slot.
+  assert.equal(miss.data.cs_not_sending, true);
+});
+
+test("badge: no not-sending state without sendable messages, or while capture is paused", async () => {
+  const empty = await started({});
+  assert.deepEqual(shown(empty), { color: BADGE_COUNT, text: "" });
+  assert.equal(empty.data.cs_not_sending, undefined);
+
+  // Every stored message already reached a node (a store carried over by hand).
+  const sent = await started({
+    cs_messages: { "conv-A": [{ id: "msg-0404", thread_id: "conv-A", role: "user", content: "x", created_at: 100, synced_at: 200 }] },
+  });
+  assert.deepEqual(shown(sent), { color: BADGE_COUNT, text: "1" });
+
+  // A chat with no id yet is held, not sendable: nothing to warn about so far.
+  const pending = await started({
+    cs_messages: { "pending:1": [{ id: "msg-0405", thread_id: "pending:1", role: "user", content: "x", created_at: 100 }] },
+  });
+  assert.deepEqual(shown(pending), { color: BADGE_COUNT, text: "1" });
+
+  const paused = await started(unsentStore());
+  await paused.send({ type: "shadow.setEnabled", enabled: false });
+  assert.deepEqual(shown(paused), { color: "#888888", text: "off" });
+  assert.equal(paused.data.cs_not_sending, undefined);
+  await paused.send({ type: "shadow.setEnabled", enabled: true });
+  assert.deepEqual(shown(paused), BADGE_NOT_SENDING);
+});
+
+test("badge: the first captured message on an unconnected install raises the state", async () => {
+  const bg = await started({});
+  assert.deepEqual(shown(bg), { color: BADGE_COUNT, text: "" });
+  await bg.send({ type: "shadow.upsert", conversation: { id: "conv-A" }, messages: [{ id: "msg-0406", role: "user", content: "x", index: 0 }] });
+  assert.deepEqual(shown(bg), BADGE_NOT_SENDING);
+  assert.match(bg.badge.title, /1 message stored here/);
+  assert.equal(bg.data.cs_not_sending, true);
+});
+
+test("badge: disconnect counts as choosing local only", async () => {
+  const bg = await started(unsentStore(TOKEN));
+  const status = await bg.send({ type: "topos.disconnect" });
+  assert.equal(bg.data.cs_topos_token, undefined);
+  assert.equal(bg.data.cs_local_only, true);
+  assert.equal(status.connected, false);
+  assert.equal(status.localOnly, true);
+  assert.equal(status.notSending, false);
+  assert.deepEqual(shown(bg), { color: BADGE_COUNT, text: "2" });
+
+  // Undoing the choice brings the warning back.
+  await bg.send({ type: "topos.setLocalOnly", localOnly: false });
+  assert.deepEqual(shown(bg), BADGE_NOT_SENDING);
+});
+
+test("content script: the chip says not sending while the flag is set, and follows it", () => {
+  const page = unitDoc([{ userId: "msg-0407", user: "sample question", assistantId: "msg-0408", assistant: "sample" }], { conversationId: "" });
+  const tab = contentHarness(`https://chatgpt.com/c/${UUID_A}`, page, { cs_not_sending: true });
+  tab.advance(3000);
+  assert.equal(tab.chip.textContent, "Shadow on · not sending · 2 on page");
+  assert.equal(tab.chip.dataset.state, "unsent");
+  // Capture itself is unchanged.
+  assert.equal(tab.sent.filter((m) => m.type === "shadow.upsert").length, 1);
+
+  // Connected, or local only chosen: back to the plain chip, count kept.
+  tab.storageChanged({ cs_not_sending: { oldValue: true } });
+  assert.equal(tab.chip.textContent, "Shadow on · 2 on page");
+  assert.equal(tab.chip.dataset.state, "on");
+
+  tab.storageChanged({ cs_not_sending: { newValue: true } });
+  assert.equal(tab.chip.dataset.state, "unsent");
+
+  // Paused wins: nothing is being captured, so there is nothing new to send.
+  tab.storageChanged({ cs_enabled: { newValue: false } });
+  assert.equal(tab.chip.textContent, "Shadow paused");
+  assert.equal(tab.chip.dataset.state, "off");
+});
+
+test("content script: a healthy install keeps the plain chip", () => {
+  const page = unitDoc([{ userId: "msg-0409", user: "sample question", assistantId: "msg-0410", assistant: "sample" }], { conversationId: "" });
+  const tab = contentHarness(`https://chatgpt.com/c/${UUID_A}`, page);
+  tab.advance(3000);
+  assert.equal(tab.chip.textContent, "Shadow on · 2 on page");
+  assert.equal(tab.chip.dataset.state, "on");
+});
+
+/** popup.js against stub elements, talking to a real background harness. */
+function popupHarness(bg) {
+  const elements = {};
+  const inFlight = [];
+  const element = (id) => {
+    if (!elements[id]) {
+      const handlers = {};
+      const classes = new Set();
+      elements[id] = {
+        id,
+        hidden: false,
+        disabled: false,
+        checked: false,
+        textContent: "",
+        innerHTML: "",
+        dataset: {},
+        classList: {
+          add: (name) => classes.add(name),
+          remove: (name) => classes.delete(name),
+          toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)),
+          contains: (name) => classes.has(name),
+        },
+        addEventListener: (type, fn) => {
+          handlers[type] = fn;
+        },
+        appendChild() {},
+        click: () => handlers.click && handlers.click(),
+      };
+    }
+    return elements[id];
+  };
+  // What popup.html ships with.
+  ["toposDisconnect", "toposSendHistory", "toposFixLinks", "toposLocalOnly", "toposUnsent", "toposProgress", "toposReceipt", "extractNotice", "updateNotice", "detail"].forEach((id) => {
+    element(id).hidden = true;
+  });
+  const box = {
+    console,
+    document: { getElementById: element, createElement: () => element(`created-${Object.keys(elements).length}`) },
+    window: { setTimeout, clearTimeout },
+    chrome: {
+      runtime: {
+        lastError: undefined,
+        sendMessage(payload, callback) {
+          inFlight.push(bg.send(payload).then((reply) => callback && callback(reply)));
+        },
+        onMessage: { addListener() {} },
+        getManifest: () => ({ version: "0.0.0" }),
+      },
+      storage: {
+        local: { get: (defaults, callback) => callback({ ...defaults }) },
+        onChanged: { addListener() {} },
+      },
+    },
+  };
+  box.globalThis = box;
+  vm.runInNewContext(fs.readFileSync(path.join(root, "popup.js"), "utf8"), box);
+  const flush = async () => {
+    while (inFlight.length) await inFlight.shift();
+  };
+  return { el: element, flush };
+}
+
+test("popup: an unconnected install states the unsent count beside Connect and offers Keep local only", async () => {
+  const bg = await started(unsentStore());
+  const popup = popupHarness(bg);
+  await popup.flush();
+  assert.equal(popup.el("toposState").textContent, "Not sending");
+  assert.equal(popup.el("toposState").dataset.state, "unsent");
+  assert.equal(popup.el("toposUnsent").hidden, false);
+  assert.equal(popup.el("toposUnsent").textContent, "2 messages not sent to Topos.");
+  assert.equal(popup.el("toposConnect").hidden, false);
+  assert.equal(popup.el("toposLocalOnly").hidden, false);
+  assert.match(popup.el("toposDetail").textContent, /not connected to Topos/);
+  assert.match(popup.el("toposDetail").textContent, /separate install/);
+
+  popup.el("toposLocalOnly").click();
+  await popup.flush();
+  assert.equal(bg.data.cs_local_only, true);
+  assert.equal(popup.el("toposState").textContent, "Local only");
+  assert.equal(popup.el("toposState").dataset.state, "");
+  assert.equal(popup.el("toposUnsent").hidden, true);
+  assert.equal(popup.el("toposLocalOnly").hidden, true);
+  assert.equal(popup.el("toposConnect").hidden, false, "Connect stays available");
+  assert.match(popup.el("toposDetail").textContent, /Local only: 2 messages stored in this browser, none sent/);
+  assert.deepEqual(shown(bg), { color: BADGE_COUNT, text: "2" });
+});
+
+test("popup: connected, expired and empty installs do not show the not-sending notice", async () => {
+  const connected = popupHarness(await started(unsentStore(TOKEN)));
+  await connected.flush();
+  assert.equal(connected.el("toposState").textContent, "Connected");
+  assert.equal(connected.el("toposUnsent").hidden, true);
+  assert.equal(connected.el("toposLocalOnly").hidden, true);
+  assert.equal(connected.el("toposSendHistory").textContent, "Send history (2)");
+
+  const expired = popupHarness(await started(unsentStore({ cs_topos_expired: true })));
+  await expired.flush();
+  assert.equal(expired.el("toposState").textContent, "Reconnect");
+  assert.equal(expired.el("toposUnsent").hidden, true);
+  assert.equal(expired.el("toposLocalOnly").hidden, true);
+
+  const empty = popupHarness(await started({}));
+  await empty.flush();
+  assert.equal(empty.el("toposState").textContent, "Not connected");
+  assert.equal(empty.el("toposUnsent").hidden, true);
+  assert.equal(empty.el("toposLocalOnly").hidden, true);
+
+  // One message reads in the singular.
+  const one = popupHarness(await started({
+    cs_messages: { "conv-A": [{ id: "msg-0411", thread_id: "conv-A", role: "user", content: "x", created_at: 100 }] },
+  }));
+  await one.flush();
+  assert.equal(one.el("toposUnsent").textContent, "1 message not sent to Topos.");
 });

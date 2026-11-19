@@ -12,7 +12,9 @@ const exportOne = document.getElementById("exportOne");
 const clearAll = document.getElementById("clearAll");
 const toposState = document.getElementById("toposState");
 const toposDetail = document.getElementById("toposDetail");
+const toposUnsent = document.getElementById("toposUnsent");
 const toposConnect = document.getElementById("toposConnect");
+const toposLocalOnly = document.getElementById("toposLocalOnly");
 const toposDisconnect = document.getElementById("toposDisconnect");
 const toposSendHistory = document.getElementById("toposSendHistory");
 const toposFixLinks = document.getElementById("toposFixLinks");
@@ -75,6 +77,16 @@ toposConnect.addEventListener("click", () => {
       toposProgress.hidden = true;
     }
     refreshTopos();
+  });
+});
+
+toposLocalOnly.addEventListener("click", () => {
+  // Local-only is a supported way to use this. The choice is stored, and the
+  // badge and the page chip stop warning that nothing is being sent.
+  chrome.runtime.sendMessage({ type: "topos.setLocalOnly", localOnly: true }, (status) => {
+    void chrome.runtime.lastError;
+    if (status) topos = status;
+    renderTopos();
   });
 });
 
@@ -157,7 +169,7 @@ chrome.runtime.onMessage.addListener((message) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
   if (changes.cs_index || changes.cs_messages || changes.cs_enabled) refresh();
-  if (Object.keys(changes).some((key) => key.startsWith("cs_topos"))) refreshTopos();
+  if (Object.keys(changes).some((key) => key.startsWith("cs_topos") || key === "cs_local_only" || key === "cs_not_sending")) refreshTopos();
   if (changes.cs_extract_miss) refreshExtractNotice();
 });
 
@@ -217,6 +229,12 @@ function renderTopos() {
   toposFixLinks.disabled = !repairQueued || Boolean(topos.syncing);
   toposFixLinks.textContent = repairQueued ? `Fix chat links (${repairQueued})` : "Fix chat links";
 
+  // Stored messages that Send history would send once an account is connected.
+  const unsent = topos.queued || 0;
+  const unsentText = `${unsent} message${unsent === 1 ? "" : "s"}`;
+  const notSending = Boolean(topos.notSending);
+  const localOnly = !connected && !topos.expired && Boolean(topos.localOnly);
+
   if (topos.expired) {
     toposState.textContent = "Reconnect";
     toposState.dataset.state = "err";
@@ -227,14 +245,37 @@ function renderTopos() {
   } else if (connected) {
     toposState.textContent = "Connected";
     toposState.dataset.state = "on";
+  } else if (notSending) {
+    toposState.textContent = "Not sending";
+    toposState.dataset.state = "unsent";
+    toposConnect.textContent = "Connect";
+  } else if (localOnly) {
+    toposState.textContent = "Local only";
+    toposState.dataset.state = "";
+    toposConnect.textContent = "Connect";
   } else {
     toposState.textContent = "Not connected";
     toposState.dataset.state = "";
     toposConnect.textContent = "Connect";
   }
 
+  // The count sits beside Connect, so an install that was never connected says
+  // how much it is holding before the person decides.
+  toposUnsent.hidden = !notSending;
+  toposUnsent.textContent = notSending ? `${unsentText} not sent to Topos.` : "";
+  toposLocalOnly.hidden = !notSending;
+
   if (topos.expired) {
     toposDetail.textContent = "Your Topos connection expired. Nothing is being sent. Connect again to resume.";
+  } else if (notSending) {
+    toposDetail.textContent =
+      "This install is not connected to Topos, so captured messages stay in this browser. " +
+      "Connect to send them, or keep them local. " +
+      "Each unpacked folder you load is a separate install and has to be connected again.";
+  } else if (localOnly) {
+    toposDetail.textContent =
+      `Local only: ${unsent ? `${unsentText} stored in this browser, none sent` : "nothing is sent"}. ` +
+      "Connect an account at any time to sync to your own Topos.";
   } else if (!connected) {
     toposDetail.textContent =
       "Capture stays in this browser. Connect an account to sync new messages to your own Topos.";

@@ -28,15 +28,27 @@
   // The URL when the pending scan was scheduled. A scan that finds another URL
   // was scheduled for a page that is no longer there.
   let scheduledHref = location.href;
+  // Mirrors the toolbar badge (ChatGPTShadowToposConfig.NOT_SENDING_KEY, set by
+  // the background worker): messages are stored here and no account is
+  // connected, so nothing is being sent.
+  let notSending = false;
+  // The count the chip last showed, kept so a repaint does not drop it.
+  let shownCount;
 
-  chrome.storage.local.get({ cs_enabled: true }, (stored) => {
+  chrome.storage.local.get({ cs_enabled: true, cs_not_sending: false }, (stored) => {
     enabled = stored.cs_enabled !== false;
+    notSending = stored.cs_not_sending === true;
     paintChip();
     scan();
   });
 
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== "local" || !changes.cs_enabled) return;
+    if (area !== "local") return;
+    if (changes.cs_not_sending) {
+      notSending = changes.cs_not_sending.newValue === true;
+      paintChip(shownCount);
+    }
+    if (!changes.cs_enabled) return;
     enabled = changes.cs_enabled.newValue !== false;
     paintChip();
     if (enabled) scan();
@@ -219,6 +231,7 @@
       chip.id = "cs-shadow-chip";
       document.documentElement.appendChild(chip);
     }
+    shownCount = Number.isFinite(visibleCount) ? visibleCount : undefined;
     if (contextLost) {
       // The count would be a lie — those messages are reaching nothing.
       chip.textContent = "Shadow \u00b7 reload this tab";
@@ -231,8 +244,15 @@
       chip.dataset.state = "warn";
       return;
     }
-    const label = enabled ? "Shadow on" : "Shadow paused";
     const count = Number.isFinite(visibleCount) ? ` · ${visibleCount} on page` : "";
+    if (enabled && notSending) {
+      // Capture works, but this install is not connected: say so on the page,
+      // where plain "Shadow on" would read as a healthy, sending install.
+      chip.textContent = `Shadow on \u00b7 not sending${count}`;
+      chip.dataset.state = "unsent";
+      return;
+    }
+    const label = enabled ? "Shadow on" : "Shadow paused";
     chip.textContent = `${label}${count}`;
     chip.dataset.state = enabled ? "on" : "off";
   }

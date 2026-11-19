@@ -4,6 +4,9 @@ const ToposConfig = ChatGPTShadowToposConfig;
 const ToposAuth = ChatGPTShadowToposAuth;
 const ToposIngest = ChatGPTShadowToposIngest;
 const TOPOS_KEYS = ToposConfig.KEYS;
+const LOCAL_ONLY_KEY = ToposConfig.LOCAL_ONLY_KEY;
+const NOT_SENDING_KEY = ToposConfig.NOT_SENDING_KEY;
+const DEFAULT_TITLE = "ChatGPT Shadow";
 
 let writeQueue = Promise.resolve();
 let syncQueue = Promise.resolve();
@@ -137,7 +140,22 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   if (message.type === "topos.disconnect") {
+    // Disconnecting is a choice to stop sending, so it does not raise the
+    // not-sending warning afterwards.
     ToposAuth.disconnect()
+      .then(() => chrome.storage.local.set({ [LOCAL_ONLY_KEY]: true }))
+      .then(() => refreshBadge())
+      .then(() => toposStatus())
+      .then(sendResponse);
+    return true;
+  }
+
+  // The person keeps capture in this browser on purpose: silence the warning.
+  if (message.type === "topos.setLocalOnly") {
+    (message.localOnly === false
+      ? chrome.storage.local.remove([LOCAL_ONLY_KEY])
+      : chrome.storage.local.set({ [LOCAL_ONLY_KEY]: true })
+    )
       .then(() => refreshBadge())
       .then(() => toposStatus())
       .then(sendResponse);
@@ -180,32 +198,87 @@ function applyChange(mutator) {
   return writeQueue;
 }
 
+/**
+ * Captured messages that Send history would send. Counts only.
+ */
+function unsentCount(state) {
+  return ChatGPTShadowStore.syncScan(state, historyOptions()).records.length;
+}
+
+/**
+ * Messages are stored here, no account is connected, and the person has not said
+ * that is what they want. An unpacked folder loaded a second time is a new
+ * install with no token, and without this state it looks like a connected one.
+ */
+function isNotSending({ connected, expired, localOnly, enabled, unsent }) {
+  return !connected && !expired && !localOnly && enabled !== false && unsent > 0;
+}
+
+async function paintBadge(color, text, title) {
+  await chrome.action.setBadgeBackgroundColor({ color });
+  await chrome.action.setBadgeText({ text });
+  if (chrome.action.setTitle) await chrome.action.setTitle({ title: title || DEFAULT_TITLE });
+}
+
+/**
+ * One state at a time, most urgent first:
+ *   red "!"     the token was rejected
+ *   amber "!"   the node is not answering
+ *   amber "?"   the open chat cannot be read
+ *   "off"       capture is paused
+ *   blue "↑!"   messages are stored and none can be sent: not connected
+ *   grey count  healthy, or local only by choice
+ */
 async function refreshBadge(state) {
   const current = state || (await readState());
   const stored = await chrome.storage.local.get({
+    [TOPOS_KEYS.token]: "",
+    [TOPOS_KEYS.resourceId]: "",
     [TOPOS_KEYS.expired]: false,
     [TOPOS_KEYS.engineWarning]: false,
+    [LOCAL_ONLY_KEY]: false,
+    [NOT_SENDING_KEY]: false,
     cs_extract_miss: null,
   });
-  if (stored[TOPOS_KEYS.expired]) {
-    await chrome.action.setBadgeBackgroundColor({ color: "#c00000" });
-    await chrome.action.setBadgeText({ text: "!" });
+  const connected = Boolean(stored[TOPOS_KEYS.token] && stored[TOPOS_KEYS.resourceId]);
+  const expired = Boolean(stored[TOPOS_KEYS.expired]);
+  const localOnly = Boolean(stored[LOCAL_ONLY_KEY]);
+  // The scan walks every row, so it runs only when its answer can matter.
+  const mayWarn = !connected && !expired && !localOnly && current.enabled !== false;
+  const unsent = mayWarn ? unsentCount(current) : 0;
+  const notSending = isNotSending({ connected, expired, localOnly, enabled: current.enabled, unsent });
+
+  // The page chip reads this flag. Written on a change only, so a capture does
+  // not cost a second storage write.
+  if (notSending !== Boolean(stored[NOT_SENDING_KEY])) {
+    if (notSending) await chrome.storage.local.set({ [NOT_SENDING_KEY]: true });
+    else await chrome.storage.local.remove([NOT_SENDING_KEY]);
+  }
+
+  if (expired) {
+    await paintBadge("#c00000", "!");
     return;
   }
   if (stored[TOPOS_KEYS.engineWarning]) {
-    await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
-    await chrome.action.setBadgeText({ text: "!" });
+    await paintBadge("#dd9900", "!");
     return;
   }
   if (stored.cs_extract_miss && current.enabled !== false) {
-    await chrome.action.setBadgeBackgroundColor({ color: "#dd9900" });
-    await chrome.action.setBadgeText({ text: "?" });
+    await paintBadge("#dd9900", "?");
+    return;
+  }
+  if (notSending) {
+    await paintBadge(
+      "#1a66d6",
+      "\u2191!",
+      `ChatGPT Shadow: ${unsent} message${unsent === 1 ? "" : "s"} stored here, none sent to Topos. ` +
+        "Open to connect, or to keep them local."
+    );
     return;
   }
   const count = ChatGPTShadowStore.messageCount(current);
   const text = current.enabled === false ? "off" : count > 999 ? "999+" : count ? String(count) : "";
-  await chrome.action.setBadgeBackgroundColor({ color: current.enabled === false ? "#888888" : "#444444" });
-  await chrome.action.setBadgeText({ text });
+  await paintBadge(current.enabled === false ? "#888888" : "#444444", text);
 }
 
 // --------------------------------------------------------------- topos ---
@@ -248,6 +321,8 @@ async function toposStatus() {
   const history = ChatGPTShadowStore.syncScan(state, historyOptions());
   const auto = ChatGPTShadowStore.syncScan(state, autoOptions(auth));
   const repair = ChatGPTShadowStore.syncScan(state, repairOptions());
+  const flags = await chrome.storage.local.get({ [LOCAL_ONLY_KEY]: false });
+  const localOnly = Boolean(flags[LOCAL_ONLY_KEY]);
   return {
     connected: auth.connected,
     expired: auth.expired,
@@ -259,6 +334,16 @@ async function toposStatus() {
     queued: history.records.length,
     queuedNew: auto.records.length,
     repairQueued: repair.records.length,
+    // The person chose to keep capture in this browser.
+    localOnly,
+    // Same test as the toolbar badge, so the popup and the badge cannot disagree.
+    notSending: isNotSending({
+      connected: auth.connected,
+      expired: auth.expired,
+      localOnly,
+      enabled: state.enabled,
+      unsent: history.records.length,
+    }),
     // Counts only: rows the node files under a chat the extension cannot correct.
     nodeSide: ChatGPTShadowStore.nodeSideCounts(state),
     held: history.held,
@@ -273,6 +358,8 @@ async function toposConnect() {
   connectRunning = true;
   try {
     await ToposAuth.connect();
+    // Connected installs send; the local-only choice no longer applies.
+    await chrome.storage.local.remove([LOCAL_ONLY_KEY]);
     await refreshBadge();
     const status = await toposStatus();
     broadcast({ type: "topos.changed" });

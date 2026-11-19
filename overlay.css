@@ -21,3 +21,9 @@
   background: #fff3d6;
   border-color: #e7c27a;
 }
+
+#cs-shadow-chip[data-state="unsent"] {
+  color: #0f3f8c;
+  background: #e3edfc;
+  border-color: #9dbcec;
+}

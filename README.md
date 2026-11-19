@@ -70,6 +70,8 @@ Same steps at `edge://extensions`.
 
 Reload the unpacked extension after updates. Reload ChatGPT so already-open tabs pick up the new content script.
 
+**Each unpacked folder is a separate install.** The browser derives an unpacked extension's id from the path of the folder it was loaded from, and the stored chats and the Topos connection belong to that id. Loading the extension from another folder, from the same folder after it was moved or renamed, or in another browser or profile, gives a new install with an empty store and no connection. It captures, and sends nothing, until you press **Connect** in it. Keep the folder where it is, and update it in place with `git pull`.
+
 > **Chrome Web Store:** A store listing may use a fixed extension ID; install steps will match the store page when published.
 
 ---
@@ -77,7 +79,7 @@ Reload the unpacked extension after updates. Reload ChatGPT so already-open tabs
 ## Use
 
 1. Open [chatgpt.com](https://chatgpt.com) and send a message, or open an existing chat.
-2. A small **Shadow on** chip appears in the corner of the page.
+2. A small **Shadow on** chip appears in the corner of the page. It reads **Shadow on · not sending** while this install holds captured messages and is not connected to Topos (see [Send to Topos](#send-to-topos)).
 3. Click the extension icon. Turns are shown as **You** (right) and **ChatGPT** (left), with ChatGPT markdown rendered.
 4. **Export JSONL** downloads one record per turn.
 5. Uncheck **Capture chats** to pause. **Clear** deletes the local copy.
@@ -109,6 +111,27 @@ Optional. Nothing below happens until you press **Connect**.
 2. From that moment, each message captured is sent once its reply settles.
 3. Everything captured *before* you connected stays local until you press **Send history**. The button shows the count first, sends in batches of at most 200 records, and reports how many were written and how many were queued for a node that is currently offline.
 4. **Disconnect** deletes the token and stops all sending. Your local copy is untouched.
+
+### An install that is not connected
+
+Capture works the same whether or not an account is connected, so an install that was never connected has to say so. While it holds captured messages, no account is connected, and you have not chosen local only:
+
+| Where | What it shows |
+|-------|---------------|
+| Toolbar badge | Blue **↑!** in place of the grey message count. Hovering the icon gives the number of messages stored and not sent. |
+| Page chip | **Shadow on · not sending** in blue, in place of **Shadow on**. |
+| Popup | A **Not sending** pill, the line *N messages not sent to Topos.* above **Connect**, and a **Keep local only** button. |
+
+There are two ways out, and both are one click in the popup:
+
+- **Connect** attaches this install to your Topos. Messages captured from then on are sent; the ones already stored go when you press **Send history**.
+- **Keep local only** records that you want capture to stay in this browser. The badge goes back to the grey count, the chip to **Shadow on**, and the pill reads **Local only**. Nothing is sent. **Connect** stays available and undoes the choice.
+
+**Disconnect** counts as choosing local only, so it does not raise the warning. The warning is not shown while capture is paused, and it gives way to the red **!**, the amber **!** and the amber **?** described under [Troubleshooting](#troubleshooting).
+
+This is per install. A copy of the extension loaded from another folder starts unconnected and shows the warning after its first captured message, even if another copy on the same machine is connected (see [Install from GitHub](#install-from-github)).
+
+### What is sent
 
 Records are sent to `POST /v1/ingestion/app_ingest` in the same shape as the JSONL export. A record is keyed on its message id, so a resend replaces rather than duplicates.
 
@@ -176,6 +199,8 @@ Data lives in `chrome.storage.local` under `cs_index` and `cs_messages`. That is
 
 Connection state lives beside it under `cs_topos_*`, including the attach token. **Disconnect** removes every one of those keys.
 
+Two flags sit outside that prefix: `cs_local_only` (you chose **Keep local only**, or disconnected) and `cs_not_sending` (messages are stored and no account is connected; the page chip reads it). Neither holds any chat text.
+
 ---
 
 ## Privacy
@@ -206,6 +231,7 @@ node --test tests/shadow.test.mjs
 | Export is empty | Capture at least one turn, or reopen a thread, then export again. |
 | Selectors miss messages after a ChatGPT redesign | Update `extract.js`, then reload the extension and the tab. |
 | Red **!** on the toolbar icon | The attach token was rejected and has been deleted. Open the popup and press **Reconnect**. |
+| Blue **↑!** on the toolbar icon, chip says **not sending** | This install holds captured messages and is not connected to Topos, so nothing is being sent. Open the popup and press **Connect**, or **Keep local only** if that is what you want. If you had connected before, this is a different install: the extension was loaded from another folder, or its folder was moved. |
 | Amber **!** on the toolbar icon | Your node did not answer the last few sends. Records stay queued in the extension; nothing was lost. |
 | **Send history** count never reaches zero | Some rows are held on purpose. The popup line under **Topos** says how many, and the held table above says why. |
 | Debug logging | `chrome://extensions` → **ChatGPT Shadow** → **Service worker** → Console. |
@@ -242,4 +268,4 @@ Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ## Version
 
-**0.2.3** — ChatGPT Shadow (Manifest V3). One chat per message id, whitespace-only recaptures are not edits, and **Fix chat links** for messages earlier versions filed under the wrong chat.
+**0.2.4** — ChatGPT Shadow (Manifest V3). An install that holds captured messages and is not connected to Topos says so on the toolbar badge, the page chip and the popup, with **Keep local only** for people who want it that way.
